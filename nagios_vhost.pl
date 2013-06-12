@@ -351,7 +351,7 @@ my $result = GetOptions (
 	"nagios-config-dir:s" => \$NAGIOSCONFIGDIR,
 	"daemon"    => \$DAEMON,
 	"use-nsca"    => \$USENSCA,
-	"external-command-file"    => \$CMD_FILE,
+	"external-command-file:s"    => \$CMD_FILE,
 	"verbose"    => \$VERBOSE
 );
 
@@ -883,14 +883,14 @@ sub run_checks_as_daemon {
 				$response = "$http://". $vhost->{name} ." returned: ". $mech->response()->code() .'.';
 				if ($mech->response()->code() != 200) {
 					$code=2;
-					debug_response("$http://". $vahost->{name}, $mech->content());
+					debug_response("$http://". $vhost->{name}, $mech->content());
 				} else {
 					if (
 						($mech->content() !~ /$query_string/) &&
 						($mech->content( format => 'text' ) !~ /$query_string/) ){
 						$response .= ' Response did not match "'. $query_string .'".';
 						$code = 3;
-						debug_response("$http://". $vahost->{name}, $mech->content());
+						debug_response("$http://". $vhost->{name}, $mech->content());
 					}
 				}	
 
@@ -904,7 +904,7 @@ sub run_checks_as_daemon {
 				}
 				print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
           $vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} .';'.
-          $code .';'. $response;
+          $code .';'. $response ."\n";
 				close CMD_FILE;
 				
 				$stva->execute($vhost->{rowid});
@@ -942,7 +942,7 @@ sub run_checks_as_daemon {
 					}
 					print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
 						$vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} .';'.
-						$code .';'. $response;
+						$code .';'. $response ."\n";
 					close CMD_FILE;
 				
 				}
