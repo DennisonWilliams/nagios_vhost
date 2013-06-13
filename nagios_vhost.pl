@@ -342,6 +342,7 @@ $DBFILE = dirname(abs_path($0)) .'/.'. basename($0) .'.db';
 $NAGIOSCONFIGDIR = '/etc/nagios3/conf.d/';
 $USENSCA = 0;
 $CMD_FILE = '/var/lib/nagios3/rw/nagios.cmd';
+my $help;
 
 my $result = GetOptions (
 	"query-string:s" => \$QUERYSTRING,
@@ -352,8 +353,14 @@ my $result = GetOptions (
 	"daemon"    => \$DAEMON,
 	"use-nsca"    => \$USENSCA,
 	"external-command-file:s"    => \$CMD_FILE,
-	"verbose"    => \$VERBOSE
+	"verbose+"    => \$VERBOSE,
+	"help" => \$help
 );
+
+if ($help) {
+	usage();
+	exit();
+}
 
 if ($DAEMON) {
 	run_checks_as_daemon();
@@ -800,7 +807,7 @@ sub run_checks_as_daemon {
 		'facility' => 'daemon',
 	);
 
-	my $logger = get_logger("Daaemon");
+	my $logger = get_logger("Daemon");
 	$logger->add_appender($appender);
 	$logger->level($DEBUG);
 	$logger->debug('Logger initialized');
@@ -883,14 +890,13 @@ sub run_checks_as_daemon {
 				$response = "$http://". $vhost->{name} ." returned: ". $mech->response()->code() .'.';
 				if ($mech->response()->code() != 200) {
 					$code=2;
-					debug_response("$http://". $vhost->{name}, $mech->content());
 				} else {
 					if (
 						($mech->content() !~ /$query_string/) &&
 						($mech->content( format => 'text' ) !~ /$query_string/) ){
 						$response .= ' Response did not match "'. $query_string .'".';
 						$code = 3;
-						debug_response("$http://". $vhost->{name}, $mech->content());
+						debug_response($vhost->{name}, $mech->content());
 					}
 				}	
 
@@ -909,6 +915,7 @@ sub run_checks_as_daemon {
 				
 				$stva->execute($vhost->{rowid});
 				while (my $vahost = $stva->fetchrow_hashref()) {
+					$code = 0;
 					$mech->add_header(HOST => $vahost->{name});
 					# This should automatically handle redirects
 					eval {
@@ -921,14 +928,13 @@ sub run_checks_as_daemon {
 					$response = "$http://". $vahost->{name} ." returned: ". $mech->response()->code() .'.';
 					if ($mech->response()->code() != 200) {
 						$code=2;
-						debug_response("$http://". $vahost->{name}, $mech->content());
 					} else {
 						if (
 							($mech->content() !~ /$query_string/) &&
 							($mech->content(format => 'text') !~ /$query_string/) ){
 							$response .= ' Response did not match "'. $query_string .'".';
+							debug_response($vhost->{name} .'-'. $vahost->{name}, $mech->content());
 							$code = 3;
-							debug_response("$http://". $vahost->{name}, $mech->content());
 						}
 					}	
 
@@ -947,9 +953,8 @@ sub run_checks_as_daemon {
 				
 				}
 			}
-			close HOSTFILE;
 		}
-		die;
+		exit();
 	}
 }
 
@@ -961,4 +966,39 @@ sub debug_response {
 	print TMP $content;
 
 	close TMP;
+}
+
+sub usage {
+print <<END;
+$0 [options]
+A tool for managing and monitoring apache vhosts in nagios.
+When this is run without the --daemon, --add-web-server, or 
+--add-vhost-query-string options this script will poll all configured 
+webservers for vhosts, and will update the nagios vhoost config files.
+
+--add-web-server <server>          : Adds a new webserver to the local database
+                                     that will later be queried for a list of
+                                     apache vhosts that it hosts.  The server
+                                     name should be accesible by ssh key auth
+--get-web-servers                  : Will generate a list oof web servers and 
+                                     vhosts stored in the application database
+--add-vhost-query-string <vhost>   : Adds a new query string for the vhost 
+                                     specified by <vhost>, the --query-string
+                                     argument is required
+--query-string <string>            : The string that will be searched for in
+                                     the page response for vhost.  Failure to
+                                     find this string will result in a nagios
+                                     error.  The default is the vhost name
+--nagios-config-dir <dir>          : The directory to place nagios vhost config
+                                     files that will be generated from the DB
+--daemon                           : Run in daemon mode where vhosts are 
+                                     queried and reported on.  In this mode all
+                                     output will be sent to syslog in the daemon
+                                     context
+--external-command-file <file>     : The externaal command file to write 
+                                     nagios results to.  Default is
+                                     /var/lib/nagios3/rw/nagios.cmd
+--verbose                          : Repeat this option to increase verbosity
+--help                             : This help message
+END
 }
