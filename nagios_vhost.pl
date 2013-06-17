@@ -896,7 +896,6 @@ sub run_checks_as_daemon {
 						($mech->content( format => 'text' ) !~ /$query_string/) ){
 						$response .= ' Response did not match "'. $query_string .'".';
 						$code = 3;
-						debug_response($vhost->{name}, $mech->content());
 					}
 				}	
 
@@ -933,7 +932,6 @@ sub run_checks_as_daemon {
 							($mech->content() !~ /$query_string/) &&
 							($mech->content(format => 'text') !~ /$query_string/) ){
 							$response .= ' Response did not match "'. $query_string .'".';
-							debug_response($vhost->{name} .'-'. $vahost->{name}, $mech->content());
 							$code = 3;
 						}
 					}	
@@ -954,7 +952,6 @@ sub run_checks_as_daemon {
 				}
 			}
 		}
-		exit();
 	}
 }
 
