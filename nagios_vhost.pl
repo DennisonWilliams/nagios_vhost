@@ -943,6 +943,7 @@ sub run_checks_as_daemon {
 			verify_hostname => 0
 		} 
 	);
+	$mech->add_handler('response_redirect' => \&response_redirect);
 	$logger->debug('Mechanize browser initialized');
 
 	while ($continue) {
@@ -1062,6 +1063,21 @@ sub run_checks_as_daemon {
 			}
 		}
 	}
+}
+
+# If the handler returns an HTTP::Request object we'll start over with processing this request instead.
+sub response_redirect {
+	my($response, $ua, $h) = @_;
+	if ($response->header('Location')) {
+		# Remove the HOST Header
+		$ua->delete_header('HOST');
+
+		# Update the uri with the Location Header value
+		# create and return a HTTP::Request object
+		# TODO: is there ever a situation where this would not be a GET?
+		return HTTP::Request->new( "GET", $response->header('Location') );
+	}
+	return;
 }
 
 sub debug_response {
