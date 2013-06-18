@@ -1068,14 +1068,26 @@ sub run_checks_as_daemon {
 # If the handler returns an HTTP::Request object we'll start over with processing this request instead.
 sub response_redirect {
 	my($response, $ua, $h) = @_;
+
+	my $url;
 	if ($response->header('Location')) {
+		if ($response->header('Location') !~ /^http/) {
+			$response->request()->as_string() =~ /GET\s+(http[^:]*):/;
+			$url = $1 .'://'. $response->request()->header('Host');
+			if ($response->header('Location') !~ /^\//) {
+				$url .= "/";
+			}
+			$url .= $response->header('Location');
+		} else {
+			$url = $response->header('Location');
+		}
+
 		# Remove the HOST Header
 		$ua->delete_header('HOST');
-
 		# Update the uri with the Location Header value
 		# create and return a HTTP::Request object
 		# TODO: is there ever a situation where this would not be a GET?
-		return HTTP::Request->new( "GET", $response->header('Location') );
+		return HTTP::Request->new( "GET", $url);
 	}
 	return;
 }
