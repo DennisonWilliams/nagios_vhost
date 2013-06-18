@@ -7,6 +7,7 @@ use Getopt::Long;
 use File::Basename;
 use Cwd 'abs_path';
 use Net::SSH qw(ssh_cmd sshopen2);
+use Net::DNS;
 
 package Apache::ConfigParserWithFileHandle;
 use Scalar::Util qw(openhandle);
@@ -383,8 +384,7 @@ if ($ADDWEBSERVER) {
 }
 
 sub initDB{
-	my ($sth, @data);
-	my $schema_version = 2;
+	my ($sth, @dat, $schema_version);
 
 	# Make sure the file exists
 	# TODO: is there any reason we should be using File::Touch here?	
@@ -415,7 +415,7 @@ sub initDB{
 		$sth->execute();
 		my $ref = $sth->fetchrow_hashref();
 		$sth->finish();
-		my $schema_version = $ref->{'value'};
+		$schema_version = $ref->{'value'};
 
 		if (!defined($schema_version)) {
 				install();
@@ -425,6 +425,7 @@ sub initDB{
 	}
 
 	# Upgrade starts here
+	my $st_schema = $DBH->prepare('UPDATE variables set value = ? where key = ?');
 	if ($schema_version == 1) { 
 		# Add nagios_host_name to vhost table
 		$sth = $DBH->prepare(
@@ -443,9 +444,111 @@ sub initDB{
 			}
 		}
 	
-		my $stu = $DBH->prepare('UPDATE variables set value = ? where key = ?');
-		$stu->execute('2', 'schema_version');		
+		$st_schema->execute('2', 'schema_version');		
+		$schema_version = 2;
 	}
+
+	# Sometimes webservers have multiple ips.  In this case checking all vhosts
+	# against the ip of the webserver returned from DNS is insufficient.  We also
+	# need the ip address that is included in the ip address that is included in 
+	# the VirtualHost directive if it exists.  If not we can use the ip address
+	# of the webserver.  This upgrade adds a ip column to the vhost table then
+	# attempts to update all exisiting vhost entries with the correct value from
+	# the webserver
+  if ($schema_version == 2) {
+		$sth = $DBH->prepare(
+			"ALTER TABLE vhost ADD COLUMN `ip` VARCHAR(15)"
+		);
+		$sth->execute();
+		$sth->finish();
+		upgrade_vhosts_with_ips();
+
+		$st_schema->execute('3', 'schema_version');		
+		$schema_version = 3;
+		# TODO: Update population function with new ip logic
+	}
+}
+
+# Foreach host in the db, login and grab the ip addr in the VirtualHost 
+# directive if it exists.  If not then get it from DNS.
+sub upgrade_vhosts_with_ips {
+	my $sth = $DBH->prepare('SELECT rowid,name from host')
+		|| die "$DBI::errstr";;
+	my $stv = $DBH->prepare('SELECT rowid,name,port from vhost where host_id=?')
+		|| die "$DBI::errstr";;
+	my $stvui = $DBH->prepare('UPDATE vhost set ip=? where rowid=?')
+		|| die "$DBI::errstr";;
+
+	$sth->execute();
+	while (my $host = $sth->fetchrow_hashref()) {
+
+		# Get the ip of the host from DNS
+		my $res = Net::DNS::Resolver->new;
+		my $query = $res->search($host->{name});
+		my $host_ip;
+		if ($query) {
+			foreach my $rr ($query->answer) {
+					next unless $rr->type eq "A";
+					$host_ip = $rr->address;
+			}
+		} else {
+			# TODO: this should be a log message and should not die
+			die "query failed(". $host->{name} ."): ". $res->errorstring;
+		}
+
+		$stv->execute($host->{rowid});
+		while (my $vhost = $stv->fetchrow_hashref()) {
+			my $get_vhost_conf_cmd = "grep -i \"servername ". $vhost->{name} ."\" /etc/apache2/sites-enabled/*";
+			print "\tGetting the config file for $vhost->{'name'}:$vhost->{'port'}...\n" if $VERBOSE;
+			my $config;
+			eval {
+				$config = ssh_cmd($host->{name}, $get_vhost_conf_cmd);
+			};
+			if ($@) {
+				die $@;
+			}
+
+			$config =~ /([^:]+):/;
+			$config = $1;
+			if (! $config ) {
+				print "\tWARNING: Could not find config file for $vhost->{'name'} on $host->{'name'}\n";
+				next;
+			}
+			my $cmd = "cat $config";
+
+			print "\tPulling the config file for $vhost->{'name'}:$vhost->{'port'} ($config)...\n" if $VERBOSE;
+			sshopen2($host->{name}, *READER, *WRITER, $cmd) ||
+				die "ssh: $!";
+
+			my $acp = Apache::ConfigParserWithFileHandle->new;
+			my $rc = $acp->parse_file(*READER);
+			# TODO: some better error handling here may be in order
+			if (!$rc) {
+				print $acp->errstr ."\n";
+				exit;
+			} #if
+
+			my $ip;
+			foreach my $sas ($acp->find_down_directive_names('serveralias')) {                    
+				my @server_names = $acp->find_siblings_directive_names($sas, 'servername');
+				my @virtual_hosts = $acp->find_siblings_and_up_directive_names($sas, 'virtualhost');
+				my $server_name  = $server_names[0]->value;
+				my $virtual_host = $virtual_hosts[0]->value;                                        
+				
+				next if ($server_name ne $vhost->{'name'});
+				next if ($virtual_host !~ /([^:]+):$vhost->{'port'}/);
+
+				$ip = $1;
+			} # foreach
+
+			if (!$ip) {
+				$ip = $host_ip;
+			}
+			print "\tAdding ip:$ip for $vhost->{'name'}:$vhost->{'port'}...\n" if $VERBOSE;
+			$stvui->execute($ip, $vhost->{'rowid'});
+		} #while
+	}
+
 }
 
 sub install {
@@ -475,6 +578,7 @@ sub install {
 			host_id INT NOT NULL,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255),
+			ip VARCHAR(15),
 			port INT NOT NULL DEFAULT 80,
 			enabled INT NOT NULL DEFAULT 1,
 			query_string VARCHAR(255),
@@ -553,7 +657,7 @@ sub collect_vhosts_from_webservers {
 		|| die "$DBI::errstr";;
 	my $stvai = $DBH->prepare('INSERT INTO vhost_alias(vhost_id, name) values(?, ?)')
 		|| die "$DBI::errstr";;
-	my $stvi = $DBH->prepare('INSERT INTO vhost(host_id, name, port) values(?, ?, ?)')
+	my $stvi = $DBH->prepare('INSERT INTO vhost(host_id, name, port, $ip) values(?, ?, ?, ?)')
 		|| die "$DBI::errstr";;
 
 	$sth->execute();
@@ -563,6 +667,21 @@ sub collect_vhosts_from_webservers {
 	while (my $host = $sth->fetchrow_hashref()) {
 		my %vhosts;
 		print "Getting vhost information from ". $host->{name} ."...\n" if $VERBOSE;
+
+		# Get the ip of the host from DNS
+		my $res = Net::DNS::Resolver->new;
+		my $query = $res->search($host->{name});
+		my $ip;
+		if ($query) {
+			foreach my $rr ($query->answer) {
+					next unless $rr->type eq "A";
+					$ip = $rr->address;
+			}
+		} else {
+			# TODO: this should be a log message and should not die
+			die "query failed(". $host->{name} ."): ". $res->errorstring;
+		}
+
 		my $vhosts = ssh_cmd($host->{name}, $get_vhosts_cmd);
 		foreach (split(/\n/, $vhosts)) {
 			my $vhost_line = $_;
@@ -575,7 +694,7 @@ sub collect_vhosts_from_webservers {
 			# Get all of the aliases from the config file
 			print "\tGetting the config file for $vhost:$port ($config)...\n" if $VERBOSE;
 			#$config = ssh_cmd($host->{name}, $get_config_file_cmd .$config);
-			sshopen2($host->{name}, *READER, *WRITER, $get_config_file_cmd .$config) ||
+			sshopen2($host->{name}, *READER, *WRITER, $config) ||
 				die "ssh: $!";
 
 			my $acp = Apache::ConfigParserWithFileHandle->new;
@@ -596,7 +715,8 @@ sub collect_vhosts_from_webservers {
 				my $virtual_host = $virtual_hosts[0]->value;
 
 				next if ($server_name ne $vhost);
-				next if ($virtual_host !~ /[^:]+:$port/);
+				next if ($virtual_host !~ /([^:]+):$port/);
+				$vhosts{$vhost}{$port}{ip} = $1 || $ip;
 				my $sa = $sas->value;
 				foreach my $alias (split(/\s+/, $sa)) {
 					$alias =~ s/^\*\./meow./;
@@ -640,7 +760,7 @@ sub collect_vhosts_from_webservers {
 			foreach (keys %{$vhosts{$vhost}}) {
 				my $port = $_;
 				print "Adding new vhost: $vhost:$port (". $host->{rowid} .")...\n" if $VERBOSE;
-				$stvi->execute($host->{rowid}, $vhost, $port);
+				$stvi->execute($host->{rowid}, $vhost, $port, $vhosts{$vhost}{port}{ip});
 				my $rowid = $DBH->func('last_insert_rowid');
 
 				foreach (@{$vhosts{$vhost}{$port}{aliases}}) {
@@ -798,7 +918,6 @@ sub run_checks_as_daemon {
 	use Log::Log4perl qw(get_logger :levels);
 	use Proc::Daemon;
 	use WWW::Mechanize;
-	use Net::DNS;
 	use Log::Dispatch;
 
 	my $appender = Log::Log4perl::Appender->new(
@@ -811,14 +930,13 @@ sub run_checks_as_daemon {
 	$logger->add_appender($appender);
 	$logger->level($DEBUG);
 	$logger->debug('Logger initialized');
-	Proc::Daemon::Init;
+	#Proc::Daemon::Init;
 	initDB();
 	$logger->debug('Application daemonized');
 
 	my $continue = 1;
 	$SIG{TERM} = sub { $continue = 0 };
 
-	my $res = Net::DNS::Resolver->new;
 	my $mech = WWW::Mechanize->new( 
 		ssl_opts => { 
 			#SSL_version => 'SSLv3',
@@ -835,7 +953,7 @@ sub run_checks_as_daemon {
 			|| die "$DBI::errstr";
 
 		my $stv = $DBH->prepare(
-			"SELECT vhost.rowid,name,port,query_string FROM vhost WHERE host_id = ? and enabled=1")
+			"SELECT vhost.rowid,name,port,ip,query_string FROM vhost WHERE host_id = ? and enabled=1")
 			#"SELECT vhost.rowid,name,port,query_string FROM vhost WHERE host_id = ? and port=443")
 			|| die "$DBI::errstr";
 
@@ -854,17 +972,6 @@ sub run_checks_as_daemon {
 
 			$host->{name} =~ /^([^\.]+)/;
 			my $short_hostname = $1;
-			my $query = $res->search($host->{name});
-			my $ip;
-			if ($query) {
-				foreach my $rr ($query->answer) {
-						next unless $rr->type eq "A";
-						$ip = $rr->address;
-				}
-			} else {
-				# TODO: this should be a log message and should not die
-				die "query failed(". $host->{name} ."): ". $res->errorstring;
-			}
 
 			$logger->debug('Processing vhosts for '. $host->{name});
 			$stv->execute($host->{rowid});
@@ -876,6 +983,7 @@ sub run_checks_as_daemon {
 					$http .= 's';
 				}
 
+				my $ip = $vhost->{ip};
 				$mech->add_header(HOST => $vhost->{name});
 				# This should automatically handle redirects
 				$logger->debug("polling $http://$ip HOST -> ". $vhost->{name} ."\n");
@@ -890,6 +998,7 @@ sub run_checks_as_daemon {
 				$response = "$http://". $vhost->{name} ." returned: ". $mech->response()->code() .'.';
 				if ($mech->response()->code() != 200) {
 					$code=2;
+					debug_response($vhost->{name}, $mech->content());
 				} else {
 					if (
 						($mech->content() !~ /$query_string/) &&
@@ -918,8 +1027,9 @@ sub run_checks_as_daemon {
 					$code = 0;
 					$mech->add_header(HOST => $vahost->{name});
 					# This should automatically handle redirects
+					my $result;
 					eval {
-						$mech->get($http ."://$ip");
+						$result = $mech->get($http ."://$ip");
 					};
 					if ($@) {
 						$logger->error("Issues: $@. vhost: ". $vahost->{name});
@@ -928,6 +1038,8 @@ sub run_checks_as_daemon {
 					$response = "$http://". $vahost->{name} ." returned: ". $mech->response()->code() .'.';
 					if ($mech->response()->code() != 200) {
 						$code=2;
+						debug_response($vhost->{name} .'-'. $vahost->{name}, 
+						$mech->response()->as_string() ."\n\n".  $mech->content());
 					} else {
 						if (
 							($mech->content() !~ /$query_string/) &&
