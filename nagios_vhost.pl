@@ -928,7 +928,7 @@ sub run_checks_as_daemon {
 
 	my $logger = get_logger("Daemon");
 	$logger->add_appender($appender);
-	$logger->level($DEBUG);
+	$logger->level($WARN);
 	$logger->debug('Logger initialized');
 	Proc::Daemon::Init;
 	initDB();
@@ -946,21 +946,21 @@ sub run_checks_as_daemon {
 	$mech->add_handler('response_redirect' => \&response_redirect);
 	$logger->debug('Mechanize browser initialized');
 
+	# Loop across all of the vhosts and alias' in the database and submit 
+	# Passive checks for them
+	my $sth = $DBH->prepare("SELECT rowid,name from host")
+		|| die "$DBI::errstr";
+
+	my $stv = $DBH->prepare(
+		"SELECT vhost.rowid,name,port,ip,query_string FROM vhost WHERE host_id = ? and enabled=1")
+		|| die "$DBI::errstr";
+
+	my $stva = $DBH->prepare(
+		"SELECT name FROM vhost_alias WHERE vhost_id = ?")
+		|| die "$DBI::errstr";
+
 	while ($continue) {
 		$logger->debug('Main loop entered');
-		# Loop across all of the vhosts and alias' in the database and submit 
-		# Passive checks for them
-		my $sth = $DBH->prepare("SELECT rowid,name from host")
-			|| die "$DBI::errstr";
-
-		my $stv = $DBH->prepare(
-			"SELECT vhost.rowid,name,port,ip,query_string FROM vhost WHERE host_id = ? and enabled=1")
-			#"SELECT vhost.rowid,name,port,query_string FROM vhost WHERE host_id = ? and port=443")
-			|| die "$DBI::errstr";
-
-		my $stva = $DBH->prepare(
-			"SELECT name FROM vhost_alias WHERE vhost_id = ?")
-			|| die "$DBI::errstr";
 
 		eval {
 			$sth->execute();
@@ -989,7 +989,7 @@ sub run_checks_as_daemon {
 				# This should automatically handle redirects
 				$logger->debug("polling $http://$ip HOST -> ". $vhost->{name} ."\n");
 				eval {
-					$response = $mech->get($http ."://$ip");
+					$mech->get($http ."://$ip");
 				};
 				if ($@) {
 					$logger->error("Issues: $@. vhost=". $vhost->{name});
@@ -1026,9 +1026,8 @@ sub run_checks_as_daemon {
 					$code = 0;
 					$mech->add_header(HOST => $vahost->{name});
 					# This should automatically handle redirects
-					my $result;
 					eval {
-						$result = $mech->get($http ."://$ip");
+						$mech->get($http ."://$ip");
 					};
 					if ($@) {
 						$logger->error("Issues: $@. vhost: ". $vahost->{name});
