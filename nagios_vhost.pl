@@ -930,7 +930,7 @@ sub run_checks_as_daemon {
 	$logger->add_appender($appender);
 	$logger->level($DEBUG);
 	$logger->debug('Logger initialized');
-	#Proc::Daemon::Init;
+	Proc::Daemon::Init;
 	initDB();
 	$logger->debug('Application daemonized');
 
@@ -998,14 +998,12 @@ sub run_checks_as_daemon {
 				$response = "$http://". $vhost->{name} ." returned: ". $mech->response()->code() .'.';
 				if ($mech->response()->code() != 200) {
 					$code=2;
-					debug_response($vhost->{name}, $mech->content());
 				} else {
 					if (
 						($mech->content() !~ /$query_string/) &&
 						($mech->content( format => 'text' ) !~ /$query_string/) ){
 						$response .= ' Response did not match "'. $query_string .'".';
 						$code = 3;
-						debug_response($vhost->{name}, $mech->content());
 					}
 				}	
 
@@ -1038,14 +1036,11 @@ sub run_checks_as_daemon {
 					$response = "$http://". $vahost->{name} ." returned: ". $mech->response()->code() .'.';
 					if ($mech->response()->code() != 200) {
 						$code=2;
-						debug_response($vhost->{name} .'-'. $vahost->{name}, 
-						$mech->response()->as_string() ."\n\n".  $mech->content());
 					} else {
 						if (
 							($mech->content() !~ /$query_string/) &&
 							($mech->content(format => 'text') !~ /$query_string/) ){
 							$response .= ' Response did not match "'. $query_string .'".';
-							debug_response($vhost->{name} .'-'. $vahost->{name}, $mech->content());
 							$code = 3;
 						}
 					}	
