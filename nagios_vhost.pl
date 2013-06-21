@@ -919,6 +919,7 @@ sub run_checks_as_daemon {
 	use Proc::Daemon;
 	use WWW::Mechanize;
 	use Log::Dispatch;
+	use LWP::ConnCache;
 
 	my $appender = Log::Log4perl::Appender->new(
 		"Log::Dispatch::Syslog",
@@ -944,6 +945,7 @@ sub run_checks_as_daemon {
 		} 
 	);
 	$mech->add_handler('response_redirect' => \&response_redirect);
+	$mech->conn_cache(LWP::ConnCache->new);
 	$logger->debug('Mechanize browser initialized');
 
 	# Loop across all of the vhosts and alias' in the database and submit 
