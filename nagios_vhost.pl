@@ -923,6 +923,7 @@ sub run_checks_as_daemon {
 
 	my $appender = Log::Log4perl::Appender->new(
 		"Log::Dispatch::Syslog",
+		#"Log::Log4perl::Appender::Screen",
 		'ident' => basename($0),
 		'facility' => 'daemon',
 	);
@@ -930,6 +931,7 @@ sub run_checks_as_daemon {
 	my $logger = get_logger("Daemon");
 	$logger->add_appender($appender);
 	$logger->level($WARN);
+	#$logger->level($DEBUG);
 	$logger->debug('Logger initialized');
 	Proc::Daemon::Init;
 	initDB();
@@ -937,16 +939,6 @@ sub run_checks_as_daemon {
 
 	my $continue = 1;
 	$SIG{TERM} = sub { $continue = 0 };
-
-	my $mech = WWW::Mechanize->new( 
-		ssl_opts => { 
-			#SSL_version => 'SSLv3',
-			verify_hostname => 0
-		} 
-	);
-	$mech->add_handler('response_redirect' => \&response_redirect);
-	$mech->conn_cache(LWP::ConnCache->new);
-	$logger->debug('Mechanize browser initialized');
 
 	# Loop across all of the vhosts and alias' in the database and submit 
 	# Passive checks for them
@@ -972,6 +964,19 @@ sub run_checks_as_daemon {
 			die $@;
 		}
 		while (my $host = $sth->fetchrow_hashref()) {
+
+			# Moving the mech object into the hoost loop will at most create 
+			# an object of size equal to (<num_vhosts> + <num_aliases>) *
+			# <memory_overhead_per_page_for_mech>
+			my $mech = WWW::Mechanize->new( 
+				ssl_opts => { 
+					#SSL_version => 'SSLv3',
+					verify_hostname => 0
+				} 
+			);
+			$mech->add_handler('response_redirect' => \&response_redirect);
+			$mech->conn_cache(LWP::ConnCache->new);
+			$logger->debug('Mechanize browser initialized');
 
 			$host->{name} =~ /^([^\.]+)/;
 			my $short_hostname = $1;
@@ -1060,10 +1065,10 @@ sub run_checks_as_daemon {
 						$code .';'. $response ."\n";
 					close CMD_FILE;
 				
-				}
-			}
-		}
-	}
+				} # $stva while loop
+			} # $stv while loop
+		} # $sth while loop
+	} # continue while loop
 }
 
 # If the handler returns an HTTP::Request object we'll start over with processing this request instead.
