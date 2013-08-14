@@ -425,130 +425,12 @@ sub initDB{
 	}
 
 	# Upgrade starts here
-	my $st_schema = $DBH->prepare('UPDATE variables set value = ? where key = ?');
-	if ($schema_version == 1) { 
-		# Add nagios_host_name to vhost table
-		$sth = $DBH->prepare(
-			"ALTER TABLE host ADD COLUMN `nagios_host_name` VARCHAR(255)"
-		);
-		$sth->execute();
-		$sth->finish();
-
-		# Migrate to the new host schema
-		$sth = $DBH->prepare('SELECT name FROM host');
-		$sth->execute();
-		while (my $host = $sth->fetchrow_hashref()) {
-			if ($host->{name} !~ /\./) {
-				my $stu = $DBH->prepare('UPDATE host set name = ?, nagios_host_name = ? where name = ?');
-				$stu->execute($host->{name} .'.radicaldesigns.org', $host->{name}, $host->{name});
-			}
-		}
-	
-		$st_schema->execute('2', 'schema_version');		
-		$schema_version = 2;
-	}
-
-	# Sometimes webservers have multiple ips.  In this case checking all vhosts
-	# against the ip of the webserver returned from DNS is insufficient.  We also
-	# need the ip address that is included in the ip address that is included in 
-	# the VirtualHost directive if it exists.  If not we can use the ip address
-	# of the webserver.  This upgrade adds a ip column to the vhost table then
-	# attempts to update all exisiting vhost entries with the correct value from
-	# the webserver
-  if ($schema_version == 2) {
-		$sth = $DBH->prepare(
-			"ALTER TABLE vhost ADD COLUMN `ip` VARCHAR(15)"
-		);
-		$sth->execute();
-		$sth->finish();
-		upgrade_vhosts_with_ips();
-
-		$st_schema->execute('3', 'schema_version');		
-		$schema_version = 3;
-		# TODO: Update population function with new ip logic
-	}
-}
-
-# Foreach host in the db, login and grab the ip addr in the VirtualHost 
-# directive if it exists.  If not then get it from DNS.
-sub upgrade_vhosts_with_ips {
-	my $sth = $DBH->prepare('SELECT rowid,name from host')
-		|| die "$DBI::errstr";;
-	my $stv = $DBH->prepare('SELECT rowid,name,port from vhost where host_id=?')
-		|| die "$DBI::errstr";;
-	my $stvui = $DBH->prepare('UPDATE vhost set ip=? where rowid=?')
-		|| die "$DBI::errstr";;
-
-	$sth->execute();
-	while (my $host = $sth->fetchrow_hashref()) {
-
-		# Get the ip of the host from DNS
-		my $res = Net::DNS::Resolver->new;
-		my $query = $res->search($host->{name});
-		my $host_ip;
-		if ($query) {
-			foreach my $rr ($query->answer) {
-					next unless $rr->type eq "A";
-					$host_ip = $rr->address;
-			}
-		} else {
-			# TODO: this should be a log message and should not die
-			die "query failed(". $host->{name} ."): ". $res->errorstring;
-		}
-
-		$stv->execute($host->{rowid});
-		while (my $vhost = $stv->fetchrow_hashref()) {
-			my $get_vhost_conf_cmd = "grep -i \"servername ". $vhost->{name} ."\" /etc/apache2/sites-enabled/*";
-			print "\tGetting the config file for $vhost->{'name'}:$vhost->{'port'}...\n" if $VERBOSE;
-			my $config;
-			eval {
-				$config = ssh_cmd($host->{name}, $get_vhost_conf_cmd);
-			};
-			if ($@) {
-				die $@;
-			}
-
-			$config =~ /([^:]+):/;
-			$config = $1;
-			if (! $config ) {
-				print "\tWARNING: Could not find config file for $vhost->{'name'} on $host->{'name'}\n";
-				next;
-			}
-			my $cmd = "cat $config";
-
-			print "\tPulling the config file for $vhost->{'name'}:$vhost->{'port'} ($config)...\n" if $VERBOSE;
-			sshopen2($host->{name}, *READER, *WRITER, $cmd) ||
-				die "ssh: $!";
-
-			my $acp = Apache::ConfigParserWithFileHandle->new;
-			my $rc = $acp->parse_file(*READER);
-			# TODO: some better error handling here may be in order
-			if (!$rc) {
-				print $acp->errstr ."\n";
-				exit;
-			} #if
-
-			my $ip;
-			foreach my $sas ($acp->find_down_directive_names('serveralias')) {                    
-				my @server_names = $acp->find_siblings_directive_names($sas, 'servername');
-				my @virtual_hosts = $acp->find_siblings_and_up_directive_names($sas, 'virtualhost');
-				my $server_name  = $server_names[0]->value;
-				my $virtual_host = $virtual_hosts[0]->value;                                        
-				
-				next if ($server_name ne $vhost->{'name'});
-				next if ($virtual_host !~ /([^:]+):$vhost->{'port'}/);
-
-				$ip = $1;
-			} # foreach
-
-			if (!$ip) {
-				$ip = $host_ip;
-			}
-			print "\tAdding ip:$ip for $vhost->{'name'}:$vhost->{'port'}...\n" if $VERBOSE;
-			$stvui->execute($ip, $vhost->{'rowid'});
-		} #while
-	}
-
+	#my $st_schema = $DBH->prepare('UPDATE variables set value = ? where key = ?');
+	#if ($schema_version == 1) { 
+		# Perform some DB upgrade operations here
+		#$st_schema->execute('2', 'schema_version');		
+		#$schema_version = 2;
+	#}
 }
 
 sub install {
@@ -557,22 +439,29 @@ sub install {
 		"CREATE TABLE variables (
 			`key` VARCHAR(255) NOT NULL,
 			`value` VARCHAR(255),
-			`nagios_host_name` VARCHAR(255),
 			PRIMARY KEY (`key`)
 	)");
 	$sth->execute();
 	$sth->finish();
 
-	# TODO: create unique key on name
+	# we keep a seperate column for the nagios_host_name because this may
+	# be different then what the hoost this script is running from uses to
+	# actually ssh to / web client to
 	$sth = $DBH->prepare(
 		"CREATE TABLE host (
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255) NOT NULL,
+			`nagios_host_name` VARCHAR(255),
 			UNIQUE(name)
 	)");
 	$sth->execute();
 	$sth->finish();
 
+	# Sometimes webservers have multiple ips.  In this case checking all vhosts
+	# against the ip of the webserver returned from DNS is insufficient.  We also
+	# need the ip address that is included in the
+	# the VirtualHost directive if it exists.  If not we can use the ip address
+	# of the webserver.  
 	$sth = $DBH->prepare(
 		"CREATE TABLE vhost (
 			host_id INT NOT NULL,
