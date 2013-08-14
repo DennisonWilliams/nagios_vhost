@@ -610,9 +610,9 @@ sub add_new_web_server_to_db{
 sub get_web_servers{
 	my $sth = $DBH->prepare('SELECT rowid,name from host')
 		|| die "$DBI::errstr";
-	my $stv = $DBH->prepare('SELECT rowid,name,port,query_string from vhost where host_id=?')
+	my $stv = $DBH->prepare('SELECT vhost_id,name,port,query_string from vhost where host_id=? order by name')
 		|| die "$DBI::errstr";
-	my $sta = $DBH->prepare('SELECT name from vhost_alias where vhost_id=?') 
+	my $sta = $DBH->prepare('SELECT name from vhost_alias where vhost_id=? order by name') 
 		|| die "$DBI::errstr";
 
 	$sth->execute();
