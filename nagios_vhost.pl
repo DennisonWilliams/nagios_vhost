@@ -401,6 +401,9 @@ sub initDB{
 		sqlite_use_immediate_transaction => 1 })
 			|| die "Could not connect to database: $DBI::errstr";
 
+	# This needs to get done so that sqlite3 honors the FK constraints
+	$DBH->do("PRAGMA foreign_keys = ON");
+
 	# TODO: this will generate a error if the schema has not been installed yet,
 	# but will not fail.
 	$sth = $DBH->prepare( 
