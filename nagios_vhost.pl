@@ -452,6 +452,7 @@ sub install {
 	# actually ssh to / web client to
 	$sth = $DBH->prepare(
 		"CREATE TABLE host (
+			host_id INTEGER PRIMARY KEY,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255) NOT NULL,
 			`nagios_host_name` VARCHAR(255),
@@ -467,24 +468,24 @@ sub install {
 	# of the webserver.  
 	$sth = $DBH->prepare(
 		"CREATE TABLE vhost (
-			host_id INT NOT NULL,
+			host_id INTEGER,
+			vhost_id INTEGER PRIMARY KEY,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255),
 			ip VARCHAR(15),
 			port INT NOT NULL DEFAULT 80,
-			enabled INT NOT NULL DEFAULT 1,
 			query_string VARCHAR(255),
-			FOREIGN KEY(host_id) REFERENCES host(rowid)
+			FOREIGN KEY(host_id) REFERENCES host(host_id) ON DELETE CASCADE
 	)");
 	$sth->execute();
 	$sth->finish();
 
 	$sth = $DBH->prepare(
 		"CREATE TABLE vhost_alias (
-			vhost_id INT NOT NULL,
+			vhost_id INTEGER,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255),
-			FOREIGN KEY(vhost_id) REFERENCES vhost(rowid)
+			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
 	)");
 	$sth->execute();
 	$sth->finish();
@@ -492,9 +493,11 @@ sub install {
 
 sub add_new_web_server_to_db{
 	my ($host) = @_;
-	my $sth = $DBH->prepare('INSERT INTO host(name) values(?)') 
+	my $sth = $DBH->prepare('INSERT INTO host(name, nagios_host_name) values(?, ?)') 
 		|| die "$DBI::errstr";;
-	$sth->execute($host);
+
+	$host =~ /^([^.]+)\./;
+	$sth->execute($host, $1);
 	print "inserted $host into the host table\n" 
 		if $VERBOSE;
 }
@@ -502,7 +505,7 @@ sub add_new_web_server_to_db{
 sub get_web_servers{
 	my $sth = $DBH->prepare('SELECT rowid,name from host')
 		|| die "$DBI::errstr";
-	my $stv = $DBH->prepare('SELECT vhost_id,name,port,query_string from vhost where host_id=? order by name')
+	my $stv = $DBH->prepare('SELECT rowid,name,port,query_string from vhost where host_id=? order by name')
 		|| die "$DBI::errstr";
 	my $sta = $DBH->prepare('SELECT name from vhost_alias where vhost_id=? order by name') 
 		|| die "$DBI::errstr";
@@ -543,13 +546,13 @@ sub collect_vhosts_from_webservers {
 		|| die "$DBI::errstr";;
 	my $stv = $DBH->prepare('SELECT * from vhost where host_id=?')
 		|| die "$DBI::errstr";;
-	my $stvd = $DBH->prepare('UPDATE vhost set enabled=0 where host_id=? and name=? and port=?')
+	my $stvd = $DBH->prepare('DELETE from vhost where host_id=?')
 		|| die "$DBI::errstr";;
-	my $std = $DBH->prepare('DELETE from vhost_alias where vhost_id=?')
+	my $stvad = $DBH->prepare('DELETE from vhost_alias where vhost_id=?')
 		|| die "$DBI::errstr";;
 	my $stvai = $DBH->prepare('INSERT INTO vhost_alias(vhost_id, name) values(?, ?)')
 		|| die "$DBI::errstr";;
-	my $stvi = $DBH->prepare('INSERT INTO vhost(host_id, name, port, $ip) values(?, ?, ?, ?)')
+	my $stvi = $DBH->prepare('INSERT INTO vhost(host_id, name, port, ip) values(?, ?, ?, ?)')
 		|| die "$DBI::errstr";;
 
 	$sth->execute();
@@ -584,9 +587,9 @@ sub collect_vhosts_from_webservers {
 			$vhosts{$vhost}{$port}{config} = $config;
 
 			# Get all of the aliases from the config file
+			my $cmd = $get_config_file_cmd . $config ."|grep -vi include";
 			print "\tGetting the config file for $vhost:$port ($config)...\n" if $VERBOSE;
-			#$config = ssh_cmd($host->{name}, $get_config_file_cmd .$config);
-			sshopen2($host->{name}, *READER, *WRITER, $config) ||
+			sshopen2($host->{name}, *READER, *WRITER, $cmd) ||
 				die "ssh: $!";
 
 			my $acp = Apache::ConfigParserWithFileHandle->new;
@@ -624,24 +627,22 @@ sub collect_vhosts_from_webservers {
 		# query_strings for them that need to be persistent.
 		# Disable all vhosts that exist in the database that were not returned
 		$stv->execute($host->{rowid});
-		while (my $vhost = $sth->fetchrow_hashref()) {
+		while (my $vhost = $stv->fetchrow_hashref()) {
+
 			if (!defined($vhosts{$vhost->{name}}{$vhost->{port}})) {
 				print "\t". $vhost->{name} .":". $vhost->{port} ." is no longer hosted on ". $host->{name}
 					.". Removing it from the DB...\n" if $VERBOSE;
-				$stvd->execute($host->{rowid}, $vhost->{name}, $vhost->{port});
+				$stvd->execute($vhost->{rowid});
 				next;
 			}
 
-			# Update all vhost entries that were returned and are different then what
-			# is in the database
-
-			# TODO: what about vhosts that are enabled again?
+			# We just remove the aliases and add the ones we found
 			print "\tRemoving aliases for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
-			$std->execute($vhost->{rowid});
+			$stvad->execute($vhost->{vhost_id});
 
 			foreach(@{$vhosts{$vhost->{name}}{$vhost->{port}}{aliases}}) {
-			  print "\nInserting ". $_ ." as alias for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;	
-				$stvai->execute($vhost->{rowid}, $_);
+			  print "\tInserting ". $_ ." as alias for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;	
+				$stvai->execute($vhost->{vhost_id}, $_);
 			}
 			delete($vhosts{$vhost->{name}}{$vhost->{port}});
 		}
@@ -652,7 +653,7 @@ sub collect_vhosts_from_webservers {
 			foreach (keys %{$vhosts{$vhost}}) {
 				my $port = $_;
 				print "Adding new vhost: $vhost:$port (". $host->{rowid} .")...\n" if $VERBOSE;
-				$stvi->execute($host->{rowid}, $vhost, $port, $vhosts{$vhost}{port}{ip});
+				$stvi->execute($host->{rowid}, $vhost, $port, $vhosts{$vhost}{$port}{ip});
 				my $rowid = $DBH->func('last_insert_rowid');
 
 				foreach (@{$vhosts{$vhost}{$port}{aliases}}) {
@@ -736,7 +737,7 @@ sub generate_nagios_config_files {
 		|| die "$DBI::errstr";
 
 	my $stv = $DBH->prepare(
-		"SELECT vhost.rowid,name,port,query_string FROM vhost WHERE host_id = ? and enabled=1")
+		"SELECT vhost.rowid,name,port,query_string FROM vhost WHERE host_id = ?")
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
@@ -838,7 +839,7 @@ sub run_checks_as_daemon {
 		|| die "$DBI::errstr";
 
 	my $stv = $DBH->prepare(
-		"SELECT vhost.rowid,name,port,ip,query_string FROM vhost WHERE host_id = ? and enabled=1")
+		"SELECT vhost.rowid,name,port,ip,query_string FROM vhost WHERE host_id = ?")
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
