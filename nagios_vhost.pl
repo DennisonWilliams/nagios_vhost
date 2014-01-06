@@ -453,7 +453,7 @@ sub install {
 	$sth->finish();
 
 	# we keep a seperate column for the nagios_host_name because this may
-	# be different then what the hoost this script is running from uses to
+	# be different then what the host this script is running from uses to
 	# actually ssh to / web client to
 	$sth = $DBH->prepare(
 		"CREATE TABLE host (
@@ -508,9 +508,9 @@ sub add_new_web_server_to_db{
 }
 
 sub get_web_servers{
-	my $sth = $DBH->prepare('SELECT rowid,name from host')
+	my $sth = $DBH->prepare('SELECT host_id,name from host')
 		|| die "$DBI::errstr";
-	my $stv = $DBH->prepare('SELECT rowid,name,port,query_string from vhost where host_id=? order by name')
+	my $stv = $DBH->prepare('SELECT vhost_id,name,port,query_string from vhost where host_id=? order by name')
 		|| die "$DBI::errstr";
 	my $sta = $DBH->prepare('SELECT name from vhost_alias where vhost_id=? order by name') 
 		|| die "$DBI::errstr";
@@ -519,22 +519,22 @@ sub get_web_servers{
 
 	while (my $host = $sth->fetchrow_hashref()) {
 		print $host->{name} ."\n";
-		$stv->execute($host->{rowid});
+		$stv->execute($host->{host_id});
 		while (my $vhost = $stv->fetchrow_hashref()) {
-			$sta->execute($vhost->{rowid});
+			$sta->execute($vhost->{vhost_id});
 			my @aliases;
 			while (my $alias = $sta->fetchrow_hashref()) {
 				push @aliases, $alias->{name};
 			}
 
-			my $vhost_str = "\t". $vhost->{name}; 
+			my $vhost_str = "\t". $vhost->{name}. ':'. $vhost->{port}; 
 
-			if ($#aliases) {
+			if ($#aliases >= 0) {
 				$vhost_str .= ": ". join(', ', @aliases);
 			}
 
 			if (defined($vhost->{query_string})) {
-				$vhost_str .= ': '. $vhost->{query_string};
+				$vhost_str .= ': "'. $vhost->{query_string} .'"';
 			}
 			print $vhost_str ."\n";
 		}
@@ -547,11 +547,13 @@ sub get_web_servers{
 # Add any new vhosts and associated alieas
 # Update any new aliases
 sub collect_vhosts_from_webservers {
-	my $sth = $DBH->prepare('SELECT rowid,name from host')
+	my $sth = $DBH->prepare('SELECT host_id,name from host')
 		|| die "$DBI::errstr";;
 	my $stv = $DBH->prepare('SELECT * from vhost where host_id=?')
 		|| die "$DBI::errstr";;
-	my $stvd = $DBH->prepare('DELETE from vhost where host_id=?')
+	my $stvd = $DBH->prepare('DELETE from vhost where vhost_id=?')
+		|| die "$DBI::errstr";;
+	my $stvu = $DBH->prepare('UPDATE vhost set ip = ? where vhost_id = ?')
 		|| die "$DBI::errstr";;
 	my $stvad = $DBH->prepare('DELETE from vhost_alias where vhost_id=?')
 		|| die "$DBI::errstr";;
@@ -581,7 +583,6 @@ sub collect_vhosts_from_webservers {
 			# TODO: this should be a log message and should not die
 			die "query failed(". $host->{name} ."): ". $res->errorstring;
 		}
-
 		my $vhosts = ssh_cmd($host->{name}, $get_vhosts_cmd);
 		foreach (split(/\n/, $vhosts)) {
 			my $vhost_line = $_;
@@ -593,7 +594,7 @@ sub collect_vhosts_from_webservers {
 
 			# Get all of the aliases from the config file
 			my $cmd = $get_config_file_cmd . $config ."|grep -vi include";
-			print "\tGetting the config file for $vhost:$port ($config)...\n" if $VERBOSE;
+			print "\tGetting the config file for $vhost:$port ($config) ...\n" if $VERBOSE;
 			sshopen2($host->{name}, *READER, *WRITER, $cmd) ||
 				die "ssh: $!";
 
@@ -606,21 +607,31 @@ sub collect_vhosts_from_webservers {
 				exit;
 			}
 
+			# The ServerName directive may appear anywhere within the definition of 
+			# a server. However, each appearance overrides the previous appearance 
+			# (within that server).  Note, this is not a required directive, some
+			# vhost configs may still not include it!
 			my @aliases;
-			my $root = $acp->root;
-			foreach my $sas ($acp->find_down_directive_names('serveralias')) {
-				my @server_names = $acp->find_siblings_directive_names($sas, 'servername');
-				my @virtual_hosts = $acp->find_siblings_and_up_directive_names($sas, 'virtualhost');
-				my $server_name  = $server_names[0]->value;
+			foreach my $sn ($acp->find_down_directive_names('servername')) {
+				my @server_aliases = $acp->find_siblings_directive_names($sn, 'serveralias');
+				my @virtual_hosts = $acp->find_siblings_and_up_directive_names($sn, 'virtualhost');
+				my $server_name  = $sn->value;
 				my $virtual_host = $virtual_hosts[0]->value;
 
 				next if ($server_name ne $vhost);
 				next if ($virtual_host !~ /([^:]+):$port/);
-				$vhosts{$vhost}{$port}{ip} = $1 || $ip;
-				my $sa = $sas->value;
-				foreach my $alias (split(/\s+/, $sa)) {
-					$alias =~ s/^\*\./meow./;
-					push(@aliases, $alias);
+				my $vhost_ip = $1;
+				$vhosts{$vhost}{$port}{ip} = $ip;
+				if ($vhost_ip && ($vhost_ip ne '*') && ($vhost_ip !~ /\s/)) {
+					$vhosts{$vhost}{$port}{ip} = $vhost_ip;
+				}
+
+				foreach my $sa (@server_aliases) {
+					my $sav = $sa->value;
+					foreach my $alias (split(/\s+/, $sav)) {
+						$alias =~ s/^\*/meow/;
+						push(@aliases, $alias);
+					}
 				}
 			}
 
@@ -631,14 +642,19 @@ sub collect_vhosts_from_webservers {
 		# We can't just delete the hosts because users may have added 
 		# query_strings for them that need to be persistent.
 		# Disable all vhosts that exist in the database that were not returned
-		$stv->execute($host->{rowid});
+		$stv->execute($host->{host_id});
 		while (my $vhost = $stv->fetchrow_hashref()) {
 
 			if (!defined($vhosts{$vhost->{name}}{$vhost->{port}})) {
 				print "\t". $vhost->{name} .":". $vhost->{port} ." is no longer hosted on ". $host->{name}
 					.". Removing it from the DB...\n" if $VERBOSE;
-				$stvd->execute($vhost->{rowid});
+				$stvd->execute($vhost->{vhost_id});
 				next;
+			}
+
+			# If ip has changed then update it
+			if ($vhost->{ip} && $vhosts{$vhost->{name}}{$vhost->{port}}{ip} ne $vhost->{ip}) {
+				$stvu->execute($vhosts{$vhost->{name}}{$vhost->{port}}{ip}, $vhost->{vhost_id});
 			}
 
 			# We just remove the aliases and add the ones we found
@@ -657,8 +673,8 @@ sub collect_vhosts_from_webservers {
 			my $vhost = $_;
 			foreach (keys %{$vhosts{$vhost}}) {
 				my $port = $_;
-				print "Adding new vhost: $vhost:$port (". $host->{rowid} .")...\n" if $VERBOSE;
-				$stvi->execute($host->{rowid}, $vhost, $port, $vhosts{$vhost}{$port}{ip});
+				print "Adding new vhost: $vhost:$port (". $host->{host_id} .")...\n" if $VERBOSE;
+				$stvi->execute($host->{host_id}, $vhost, $port, $vhosts{$vhost}{$port}{ip});
 				my $rowid = $DBH->func('last_insert_rowid');
 
 				foreach (@{$vhosts{$vhost}{$port}{aliases}}) {
@@ -673,11 +689,11 @@ sub collect_vhosts_from_webservers {
 }
 
 sub generate_check_vhost_config_files {
-	my $sth = $DBH->prepare("SELECT rowid,name from host")
+	my $sth = $DBH->prepare("SELECT host_id,name from host")
 		|| die "$DBI::errstr";
 
 	my $stv = $DBH->prepare(
-		"SELECT vhost.rowid,name,port,query_string FROM vhost WHERE host_id = ?")
+		"SELECT vhost.vhost_id,name,port,query_string FROM vhost WHERE host_id = ?")
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
@@ -698,11 +714,11 @@ sub generate_check_vhost_config_files {
 			if $VERBOSE;
 		open (HOSTFILE, '+>', $NAGIOSCONFIGDIR . $host->{name} .'.txt')
 			|| die('Could not open the vhost config file ('. $NAGIOSCONFIGDIR . $host->{name} .'.txt' .'): '. $?);
-		$stv->execute($host->{rowid});
+		$stv->execute($host->{host_id});
 		while (my $vhost = $stv->fetchrow_hashref()) {
 			print HOSTFILE $vhost->{name} ." ".$vhost->{port} ." ". 
 				(defined($vhost->{query_string})?$vhost->{query_string}:'') ."\n";
-			$stva->execute($vhost->{rowid});
+			$stva->execute($vhost->{vhost_id});
 			while (my $vahost = $stva->fetchrow_hashref()) {
 				print HOSTFILE $vahost->{name} ." ".$vhost->{port} ." ". 
 					(defined($vhost->{query_string})?$vhost->{query_string}:'') ."\n";
@@ -720,13 +736,13 @@ sub reload_nagios {
 # TODO: do we need to be able to add different query_strings for different 
 # vhosts based by port?
 sub add_vhost_query_string {
-	my $sth = $DBH->prepare('SELECT rowid FROM vhost WHERE name = ?')
+	my $sth = $DBH->prepare('SELECT vhost_id FROM vhost WHERE name = ?')
 		|| die "$DBI::errstr";;
 	$sth->execute($ADDVHOSTQUERYSTRING);
 	my $vhost = $sth->fetchrow_hashref();
 	die 'Can not add a query string for a vhost that has not been added yet. '.
 		$ADDVHOSTQUERYSTRING .' does not exist in the database'
-		if (!$vhost->{rowid});
+		if (!$vhost->{vhost_id});
 
 	# TODO: we should prolly sanitize this data we are inserting
 	$sth = $DBH->prepare('UPDATE vhost set query_string = ? WHERE name = ?')
@@ -738,11 +754,11 @@ sub add_vhost_query_string {
 }
 
 sub generate_nagios_config_files {
-	my $sth = $DBH->prepare("SELECT rowid,name from host")
+	my $sth = $DBH->prepare("SELECT host_id,name from host")
 		|| die "$DBI::errstr";
 
 	my $stv = $DBH->prepare(
-		"SELECT vhost.rowid,name,port,query_string FROM vhost WHERE host_id = ?")
+		"SELECT vhost.vhost_id,name,port,query_string FROM vhost WHERE host_id = ?")
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
@@ -761,7 +777,7 @@ sub generate_nagios_config_files {
 			if $VERBOSE;
 		open (HOSTFILE, '+>', $NAGIOSCONFIGDIR . $host->{name} .'_vhosts.cfg')
 			|| die('Could not open the vhost config file ('. $NAGIOSCONFIGDIR . $host->{name} .'_vhosts.cfg' .'): '. $?);
-		$stv->execute($host->{rowid});
+		$stv->execute($host->{host_id});
 		while (my $vhost = $stv->fetchrow_hashref()) {
 			print HOSTFILE "define service {\n".
 				"\tuse generic-service-passive-no-notification-no-perfdata\n".
@@ -777,7 +793,7 @@ sub generate_nagios_config_files {
 				"\texecution_failure_criteria n\n".
 				"\tnotification_failure_criteria w,u,c,p\n}\n\n";
 
-			$stva->execute($vhost->{rowid});
+			$stva->execute($vhost->{vhost_id});
 			while (my $vahost = $stva->fetchrow_hashref()) {
 				print HOSTFILE "define service {\n".
 					"\tuse generic-service-passive-no-notification-no-perfdata\n".
@@ -840,11 +856,11 @@ sub run_checks_as_daemon {
 
 	# Loop across all of the vhosts and alias' in the database and submit 
 	# Passive checks for them
-	my $sth = $DBH->prepare("SELECT rowid,name from host")
+	my $sth = $DBH->prepare("SELECT host_id,name from host")
 		|| die "$DBI::errstr";
 
 	my $stv = $DBH->prepare(
-		"SELECT vhost.rowid,name,port,ip,query_string FROM vhost WHERE host_id = ?")
+		"SELECT vhost.vhost_id,name,port,ip,query_string FROM vhost WHERE host_id = ?")
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
@@ -863,7 +879,7 @@ sub run_checks_as_daemon {
 		}
 		while (my $host = $sth->fetchrow_hashref()) {
 
-			# Moving the mech object into the hoost loop will at most create 
+			# Moving the mech object into the host loop will at most create 
 			# an object of size equal to (<num_vhosts> + <num_aliases>) *
 			# <memory_overhead_per_page_for_mech>
 			my $mech = WWW::Mechanize->new( 
@@ -880,7 +896,7 @@ sub run_checks_as_daemon {
 			my $short_hostname = $1;
 
 			$logger->debug('Processing vhosts for '. $host->{name});
-			$stv->execute($host->{rowid});
+			$stv->execute($host->{host_id});
 			while (my $vhost = $stv->fetchrow_hashref()) {
 				my ($response, $code, $perfdata, $passive_check);
 				$code = 0;
@@ -892,7 +908,7 @@ sub run_checks_as_daemon {
 				my $ip = $vhost->{ip};
 				$mech->add_header(HOST => $vhost->{name});
 				# This should automatically handle redirects
-				$logger->debug("polling $http://$ip HOST -> ". $vhost->{name} ."\n");
+				$logger->debug("polling $http://$ip HOST -> ". $vhost->{name} .":". $vhost->{ip} ."\n");
 				eval {
 					$mech->get($http ."://$ip");
 				};
@@ -926,7 +942,7 @@ sub run_checks_as_daemon {
           $code .';'. $response ."\n";
 				close CMD_FILE;
 				
-				$stva->execute($vhost->{rowid});
+				$stva->execute($vhost->{vhost_id});
 				while (my $vahost = $stva->fetchrow_hashref()) {
 					$code = 0;
 					$mech->add_header(HOST => $vahost->{name});
@@ -1094,13 +1110,13 @@ $0 [options]
 A tool for managing and monitoring apache vhosts in nagios.
 When this is run without the --daemon, --add-web-server, or 
 --add-vhost-query-string options this script will poll all configured 
-webservers for vhosts, and will update the nagios vhoost config files.
+webservers for vhosts, and will update the nagios vhost config files.
 
 --add-web-server <server>          : Adds a new webserver to the local database
                                      that will later be queried for a list of
                                      apache vhosts that it hosts.  The server
                                      name should be accesible by ssh key auth
---get-web-servers                  : Will generate a list oof web servers and 
+--get-web-servers                  : Will generate a list of web servers and 
                                      vhosts stored in the application database
 --add-vhost-query-string <vhost>   : Adds a new query string for the vhost 
                                      specified by <vhost>, the --query-string
