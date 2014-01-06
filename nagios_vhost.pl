@@ -338,6 +338,7 @@ package main;
 
 our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
+our ($DEBUGDAEMON);
 $VERBOSE = 0;
 $DBFILE = dirname(abs_path($0)) .'/.'. basename($0) .'.db';
 $NAGIOSCONFIGDIR = '/etc/nagios3/conf.d/';
@@ -352,6 +353,7 @@ my $result = GetOptions (
 	"add-vhost-query-string:s" => \$ADDVHOSTQUERYSTRING,
 	"nagios-config-dir:s" => \$NAGIOSCONFIGDIR,
 	"daemon"    => \$DAEMON,
+	"debug-daemon:s"    => \$DEBUGDAEMON,
 	"use-nsca"    => \$USENSCA,
 	"external-command-file:s"    => \$CMD_FILE,
 	"verbose+"    => \$VERBOSE,
@@ -363,7 +365,10 @@ if ($help) {
 	exit();
 }
 
-if ($DAEMON) {
+if ($DEBUGDAEMON) {
+	daemon_debug();
+	exit();
+} elsif ($DAEMON) {
 	run_checks_as_daemon();
 	exit();
 }
@@ -963,6 +968,88 @@ sub run_checks_as_daemon {
 		} # $sth while loop
 	} # continue while loop
 }
+
+sub daemon_debug {
+	use Log::Log4perl qw(get_logger :levels);
+	use WWW::Mechanize;
+	use Log::Dispatch;
+	use LWP::ConnCache;
+
+	my $appender = Log::Log4perl::Appender->new(
+		#"Log::Dispatch::Syslog",
+		"Log::Log4perl::Appender::Screen",
+		'ident' => basename($0),
+		'facility' => 'daemon',
+	);
+
+	my $logger = get_logger("Daemon");
+	$logger->add_appender($appender);
+	$logger->level($DEBUG);
+	$logger->debug('Logger initialized');
+
+	my $continue = 1;
+	$SIG{TERM} = sub { $continue = 0 };
+
+	# TODO: pass in host
+	# --debug-daemon <hostname>:<vhostname>:<ip_address>:<port>
+	my ($host, $vhost, $ip, $port, $query_string) = split(/:/, $DEBUGDAEMON);
+	$logger->debug("$host, $vhost, $ip, $port, $query_string");
+
+	# Moving the mech object into the hoost loop will at most create 
+	# an object of size equal to (<num_vhosts> + <num_aliases>) *
+	# <memory_overhead_per_page_for_mech>
+	my $mech = WWW::Mechanize->new( 
+		ssl_opts => { 
+			#SSL_version => 'SSLv3',
+			verify_hostname => 0
+		} 
+	);
+	$mech->add_handler('response_redirect' => \&response_redirect);
+	$mech->conn_cache(LWP::ConnCache->new);
+	$logger->debug('Mechanize browser initialized');
+
+	$host =~ /^([^\.]+)/;
+	my $short_hostname = $1;
+
+	my ($response, $code, $perfdata, $passive_check);
+	$code = 0;
+	my $http = 'http';
+	if ($port == 443) {
+		$http .= 's';
+	}
+
+	$mech->add_header(HOST => $vhost);
+	# This should automatically handle redirects
+	$logger->debug("polling $http://$ip HOST -> ". $vhost ."\n");
+	eval {
+		$mech->get($http ."://$ip");
+	};
+	if ($@) {
+		$logger->error("Issues: $@. vhost=". $vhost);
+	}
+
+	my $qs = defined($query_string)?$query_string:$vhost;
+	$response = "$http://". $vhost ." returned: ". $mech->response()->code() .'.';
+	if ($mech->response()->code() != 200) {
+		$code=2;
+	} else {
+		if (
+			($mech->content() !~ /$qs/) &&
+			($mech->content( format => 'text' ) !~ /$qs/) ){
+			$response .= ' Response did not match "'. $qs .'".';
+			$code = 3;
+		}
+	}	
+
+	$logger->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $host .';'. 
+		$vhost .':'. $port .' on '. $host .';'. 
+		$code .';'. $response);
+
+	print '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
+		$vhost .':'. $port .' on '. $host .';'.
+		$code .';'. $response ."\n";
+}
+
 
 # If the handler returns an HTTP::Request object we'll start over with processing this request instead.
 sub response_redirect {
