@@ -1003,9 +1003,6 @@ sub daemon_debug {
 	$logger->level($DEBUG);
 	$logger->debug('Logger initialized');
 
-	my $continue = 1;
-	$SIG{TERM} = sub { $continue = 0 };
-
 	# TODO: pass in host
 	# --debug-daemon <hostname>:<vhostname>:<ip_address>:<port>
 	my ($host, $vhost, $ip, $port, $query_string) = split(/:/, $DEBUGDAEMON);
@@ -1027,8 +1024,7 @@ sub daemon_debug {
 	$host =~ /^([^\.]+)/;
 	my $short_hostname = $1;
 
-	my ($response, $code, $perfdata, $passive_check);
-	$code = 0;
+	my $code = 0;
 	my $http = 'http';
 	if ($port == 443) {
 		$http .= 's';
@@ -1045,7 +1041,7 @@ sub daemon_debug {
 	}
 
 	my $qs = defined($query_string)?$query_string:$vhost;
-	$response = "$http://". $vhost ." returned: ". $mech->response()->code() .'.';
+	my $response = "$http://". $vhost ." returned: ". $mech->response()->code() .'.';
 	if ($mech->response()->code() != 200) {
 		$code=2;
 	} else {
@@ -1073,6 +1069,9 @@ sub response_redirect {
 
 	my $url;
 	if ($response->header('Location')) {
+		print "response_redirect() recived Location header: ". 
+			$response->header('Location') ."\n"
+			if ($VERBOSE);
 		if ($response->header('Location') !~ /^http/) {
 			$response->request()->as_string() =~ /GET\s+(http[^:]*):/;
 			$url = $1 .'://'. $response->request()->header('Host');
@@ -1083,6 +1082,9 @@ sub response_redirect {
 		} else {
 			$url = $response->header('Location');
 		}
+
+		print "response_redirect() new url: $url\n"
+			if ($VERBOSE);
 
 		# Remove the HOST Header
 		$ua->delete_header('HOST');
