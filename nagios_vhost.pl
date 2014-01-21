@@ -1063,34 +1063,42 @@ sub daemon_debug {
 }
 
 
+# We actually want to stay on the same server so we only chnage the HOST
+# and the path.
 # If the handler returns an HTTP::Request object we'll start over with processing this request instead.
 sub response_redirect {
 	my($response, $ua, $h) = @_;
 
 	my $url;
 	if ($response->header('Location')) {
+		$response->request()->as_string() =~ /GET\s+(http[^:]*):\/\/([^\/\s]+)/;
+		my $http = $1;
+		my $ip = $2;
 		print "response_redirect() recived Location header: ". 
 			$response->header('Location') ."\n"
 			if ($VERBOSE);
 		if ($response->header('Location') !~ /^http/) {
-			$response->request()->as_string() =~ /GET\s+(http[^:]*):/;
-			$url = $1 .'://'. $response->request()->header('Host');
+			$url = $http .'://'. $ip;
 			if ($response->header('Location') !~ /^\//) {
 				$url .= "/";
 			}
 			$url .= $response->header('Location');
 		} else {
-			$url = $response->header('Location');
+			$response->header('Location') =~ /(http[^:]*):\/\/([^\/]+)(\/.*)?/;
+			print "response_redirect() HOST header: $2\n"
+				if ($VERBOSE);
+			$ua->add_header(HOST => $2);
+			$url = $1 .'://'. $ip . $3;
 		}
 
 		print "response_redirect() new url: $url\n"
 			if ($VERBOSE);
 
-		# Remove the HOST Header
-		$ua->delete_header('HOST');
 		# Update the uri with the Location Header value
 		# create and return a HTTP::Request object
 		# TODO: is there ever a situation where this would not be a GET?
+		# The optional $header argument should be a reference to an "HTTP::Headers" 
+		# object or a plain array reference of key/value pairs.
 		return HTTP::Request->new( "GET", $url);
 	}
 	return;
