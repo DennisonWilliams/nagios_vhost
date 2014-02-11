@@ -383,8 +383,7 @@ if ($ADDWEBSERVER) {
 		if (!defined($QUERYSTRING));
 	add_vhost_query_string();
 } else {
-	#collect_vhosts_from_webservers();
-	#generate_check_vhost_config_files();
+	collect_vhosts_from_webservers();
 	generate_nagios_config_files();
 }
 
@@ -563,7 +562,7 @@ sub collect_vhosts_from_webservers {
 		|| die "$DBI::errstr";;
 
 	$sth->execute();
-	my $get_vhosts_cmd = "/usr/bin/sudo /usr/sbin/apache2ctl -D DUMP_VHOSTS 2>/dev/null|grep namevhost";
+	my $get_vhosts_cmd = "sudo apachectl -t -D DUMP_VHOSTS";
 	my $get_config_file_cmd = "/bin/cat ";
 
 	while (my $host = $sth->fetchrow_hashref()) {
@@ -583,10 +582,12 @@ sub collect_vhosts_from_webservers {
 			# TODO: this should be a log message and should not die
 			die "query failed(". $host->{name} ."): ". $res->errorstring;
 		}
-		my $vhosts = ssh_cmd($host->{name}, $get_vhosts_cmd);
-		foreach (split(/\n/, $vhosts)) {
+
+		print "Running `$get_vhosts_cmd`\n" if $VERBOSE;	
+		my $vhosts = sshopen2($host->{name}, *READER, *WRITER, $get_vhosts_cmd);
+		while (<READER>) {
 			my $vhost_line = $_;
-			$vhost_line =~ /port (\d+) namevhost ([^\s]+) \(([^:]+):\d+\)/;
+			next if ($vhost_line !~ /port (\d+) namevhost ([^\s]+) \(([^:]+):\d+\)/);
 			my $port = $1;
 			my $vhost = $2;	
 			my $config = $3;
@@ -595,11 +596,11 @@ sub collect_vhosts_from_webservers {
 			# Get all of the aliases from the config file
 			my $cmd = $get_config_file_cmd . $config ."|grep -vi include";
 			print "\tGetting the config file for $vhost:$port ($config) ...\n" if $VERBOSE;
-			sshopen2($host->{name}, *READER, *WRITER, $cmd) ||
+			sshopen2($host->{name}, *READER2, *WRITER, $cmd) ||
 				die "ssh: $!";
 
 			my $acp = Apache::ConfigParserWithFileHandle->new;
-			my $rc = $acp->parse_file(*READER);
+			my $rc = $acp->parse_file(*READER2);
 
 			# TODO: some better error handling here may be in order
 			if (!$rc) {
