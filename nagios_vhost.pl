@@ -848,12 +848,14 @@ sub run_checks_as_daemon {
 	$logger->level($WARN);
 	#$logger->level($DEBUG);
 	$logger->debug('Logger initialized');
-	Proc::Daemon::Init;
-	initDB();
-	$logger->debug('Application daemonized');
 
 	my $continue = 1;
 	$SIG{TERM} = sub { $continue = 0 };
+	$SIG{USR1} = sub { print_statistics($logger); };
+
+	Proc::Daemon::Init;
+	initDB();
+	$logger->debug('Application daemonized');
 
 	# Loop across all of the vhosts and alias' in the database and submit 
 	# Passive checks for them
@@ -1113,6 +1115,43 @@ sub debug_response {
 	print TMP $content;
 
 	close TMP;
+}
+
+sub print_statistics {
+	use Log::Log4perl qw(:levels);
+	my ($logger) = @_;
+
+	# Make sure we are not called unless we are running in daemon mode
+	return if (!$DAEMON);
+
+	# Set up the queries
+	my $sth_hosts = $DBH->prepare(
+		"SELECT host.host_id,host.name,count(vhost.vhost_id) as vhosts from host ".
+		"LEFT JOIN vhost ON (vhost.host_id = host.host_id) ".
+		"GROUP BY host.host_id");
+
+	my $sth_vhosts = $DBH->prepare(
+		"SELECT vhost.vhost_id,vhost.name,count(vhost_alias.name) as vhost_aliases from vhost ".
+		"LEFT JOIN vhost_alias ON (vhost.vhost_id = vhost_alias.vhost_id) ".
+		"WHERE vhost.host_id = ? ".
+		"GROUP BY vhost.vhost_id");
+
+	# For each host print the number of vhosts and vhost_aliases we are checking
+	$sth_hosts->execute();
+	my $level = $logger->level();
+	$logger->level($INFO);
+	while (my $host = $sth_hosts->fetchrow_hashref()) {
+		my $vhost_aliases = 0;
+		$sth_vhosts->execute($host->{host_id});
+		while (my $vhost = $sth_vhosts->fetchrow_hashref()) {
+			$vhost_aliases += $vhost->{vhost_aliases};
+		}
+		$logger->info($host->{name} .' '. ($host->{vhosts}+$vhost_aliases) .' checks ('.
+			$host->{vhosts} .' vhosts, '. $vhost_aliases ." aliases)");
+	}
+	$logger->level($level);
+
+	# TODO: Print the time between checks in average, std dev, max, and min
 }
 
 sub usage {
