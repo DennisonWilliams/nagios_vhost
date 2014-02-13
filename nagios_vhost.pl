@@ -338,7 +338,15 @@ package main;
 
 our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
-our ($DEBUGDAEMON);
+our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
+
+# The max amount of time that can pass between checking vhosts in seconds
+$MAXTURNAROUNDTIME = 10*60;
+
+# This sets the maximum simultaneous web requests we can make to a server in
+# an attempt to speed up the checking of server vhosts
+$MAXTHREADSPERHOST = 5;
+
 $VERBOSE = 0;
 $DBFILE = dirname(abs_path($0)) .'/.'. basename($0) .'.db';
 $NAGIOSCONFIGDIR = '/etc/nagios3/conf.d/';
@@ -353,7 +361,6 @@ my $result = GetOptions (
 	"add-vhost-query-string:s" => \$ADDVHOSTQUERYSTRING,
 	"nagios-config-dir:s" => \$NAGIOSCONFIGDIR,
 	"daemon"    => \$DAEMON,
-	"debug-daemon:s"    => \$DEBUGDAEMON,
 	"use-nsca"    => \$USENSCA,
 	"external-command-file:s"    => \$CMD_FILE,
 	"verbose+"    => \$VERBOSE,
@@ -365,10 +372,7 @@ if ($help) {
 	exit();
 }
 
-if ($DEBUGDAEMON) {
-	daemon_debug();
-	exit();
-} elsif ($DAEMON) {
+if ($DAEMON) {
 	run_checks_as_daemon();
 	exit();
 }
@@ -843,228 +847,60 @@ sub run_checks_as_daemon {
 		'facility' => 'daemon',
 	);
 
-	my $logger = get_logger("Daemon");
-	$logger->add_appender($appender);
-	$logger->level($WARN);
-	#$logger->level($DEBUG);
-	$logger->debug('Logger initialized');
+	$LOGGER = get_logger("Daemon");
+	$LOGGER->add_appender($appender);
+	#$LOGGER->level($WARN);
+	$LOGGER->level($DEBUG);
+	$LOGGER->debug('Logger initialized');
 
-	my $continue = 1;
-	$SIG{TERM} = sub { $continue = 0 };
-	$SIG{USR1} = sub { print_statistics($logger); };
+	my @servers;
+	$SIG{TERM} = sub { 
+		my @kids = keys @servers;
+		kill 9, @kids;
+	};
+	
+	# With this handler does this mean that each child will inherit this? Yes,
+	# but each child has its own process so it does not get printed by each 
+	# process only the one you send the signal to
+	$SIG{USR1} = sub { print_statistics(); };
 
 	Proc::Daemon::Init;
 	initDB();
-	$logger->debug('Application daemonized');
+	$LOGGER->debug('Application daemonized');
 
 	# Loop across all of the vhosts and alias' in the database and submit 
 	# Passive checks for them
 	my $sth = $DBH->prepare("SELECT host_id,name from host")
 		|| die "$DBI::errstr";
 
-	my $stv = $DBH->prepare(
-		"SELECT vhost.vhost_id,name,port,ip,query_string FROM vhost WHERE host_id = ?")
-		|| die "$DBI::errstr";
-
-	my $stva = $DBH->prepare(
-		"SELECT name FROM vhost_alias WHERE vhost_id = ?")
-		|| die "$DBI::errstr";
-
-	while ($continue) {
-		$logger->debug('Main loop entered');
-
-		eval {
-			$sth->execute();
-		};
-		if ($@) {
-			$logger->fatal($@);
-			die $@;
-		}
-		while (my $host = $sth->fetchrow_hashref()) {
-
-			# Moving the mech object into the host loop will at most create 
-			# an object of size equal to (<num_vhosts> + <num_aliases>) *
-			# <memory_overhead_per_page_for_mech>
-			my $mech = WWW::Mechanize->new( 
-				ssl_opts => { 
-					#SSL_version => 'SSLv3',
-					verify_hostname => 0
-				} 
-			);
-			$mech->add_handler('response_redirect' => \&response_redirect);
-			$mech->conn_cache(LWP::ConnCache->new);
-			$logger->debug('Mechanize browser initialized');
-
-			$host->{name} =~ /^([^\.]+)/;
-			my $short_hostname = $1;
-
-			$logger->debug('Processing vhosts for '. $host->{name});
-			$stv->execute($host->{host_id});
-			while (my $vhost = $stv->fetchrow_hashref()) {
-				my ($response, $code, $perfdata, $passive_check);
-				$code = 0;
-				my $http = 'http';
-				if ($vhost->{port} == 443) {
-					$http .= 's';
-				}
-
-				my $ip = $vhost->{ip};
-				$mech->add_header(HOST => $vhost->{name});
-				# This should automatically handle redirects
-				$logger->debug("polling $http://$ip HOST -> ". $vhost->{name} .":". $vhost->{ip} ."\n");
-				eval {
-					$mech->get($http ."://$ip");
-				};
-				if ($@) {
-					$logger->error("Issues: $@. vhost=". $vhost->{name});
-				}
-
-				my $query_string = defined($vhost->{query_string})?$vhost->{query_string}:$vhost->{name};
-				$response = "$http://". $vhost->{name} ." returned: ". $mech->response()->code() .'.';
-				if ($mech->response()->code() != 200) {
-					$code=2;
-				} else {
-					if (
-						($mech->content() !~ /$query_string/) &&
-						($mech->content( format => 'text' ) !~ /$query_string/) ){
-						$response .= ' Response did not match "'. $query_string .'".';
-						$code = 3;
-					}
-				}	
-
-				$logger->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $host->{name} .';'. 
-					$vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} .';'. 
-					$code .';'. $response);
-
-				if (! open(CMD_FILE, '>>', $CMD_FILE)) {
-					$logger->fatal("Could not open $CMD_FILE to append data to: $!");
-					die;
-				}
-				print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
-          $vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} .';'.
-          $code .';'. $response ."\n";
-				close CMD_FILE;
-				
-				$stva->execute($vhost->{vhost_id});
-				while (my $vahost = $stva->fetchrow_hashref()) {
-					$code = 0;
-					$mech->add_header(HOST => $vahost->{name});
-					# This should automatically handle redirects
-					eval {
-						$mech->get($http ."://$ip");
-					};
-					if ($@) {
-						$logger->error("Issues: $@. vhost: ". $vahost->{name});
-					}
-
-					$response = "$http://". $vahost->{name} ." returned: ". $mech->response()->code() .'.';
-					if ($mech->response()->code() != 200) {
-						$code=2;
-					} else {
-						if (
-							($mech->content() !~ /$query_string/) &&
-							($mech->content(format => 'text') !~ /$query_string/) ){
-							$response .= ' Response did not match "'. $query_string .'".';
-							$code = 3;
-						}
-					}	
-
-					$logger->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $host->{name} .';'. 
-						$vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} .';'. 
-						$code .';'. $response);
-
-					if (! open(CMD_FILE, '>>', $CMD_FILE)) {
-						$logger->fatal("Could not open $CMD_FILE to append data to: $!");
-						die;
-					}
-					print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
-						$vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} .';'.
-						$code .';'. $response ."\n";
-					close CMD_FILE;
-				
-				} # $stva while loop
-			} # $stv while loop
-		} # $sth while loop
-	} # continue while loop
-}
-
-sub daemon_debug {
-	use Log::Log4perl qw(get_logger :levels);
-	use WWW::Mechanize;
-	use Log::Dispatch;
-	use LWP::ConnCache;
-
-	my $appender = Log::Log4perl::Appender->new(
-		#"Log::Dispatch::Syslog",
-		"Log::Log4perl::Appender::Screen",
-		'ident' => basename($0),
-		'facility' => 'daemon',
-	);
-
-	my $logger = get_logger("Daemon");
-	$logger->add_appender($appender);
-	$logger->level($DEBUG);
-	$logger->debug('Logger initialized');
-
-	# TODO: pass in host
-	# --debug-daemon <hostname>:<vhostname>:<ip_address>:<port>
-	my ($host, $vhost, $ip, $port, $query_string) = split(/:/, $DEBUGDAEMON);
-	$logger->debug("$host, $vhost, $ip, $port, $query_string");
-
-	# Moving the mech object into the hoost loop will at most create 
-	# an object of size equal to (<num_vhosts> + <num_aliases>) *
-	# <memory_overhead_per_page_for_mech>
-	my $mech = WWW::Mechanize->new( 
-		ssl_opts => { 
-			#SSL_version => 'SSLv3',
-			verify_hostname => 0
-		} 
-	);
-	$mech->add_handler('response_redirect' => \&response_redirect);
-	$mech->conn_cache(LWP::ConnCache->new);
-	$logger->debug('Mechanize browser initialized');
-
-	$host =~ /^([^\.]+)/;
-	my $short_hostname = $1;
-
-	my $code = 0;
-	my $http = 'http';
-	if ($port == 443) {
-		$http .= 's';
-	}
-
-	$mech->add_header(HOST => $vhost);
-	# This should automatically handle redirects
-	$logger->debug("polling $http://$ip HOST -> ". $vhost ."\n");
 	eval {
-		$mech->get($http ."://$ip");
+		$sth->execute();
 	};
 	if ($@) {
-		$logger->error("Issues: $@. vhost=". $vhost);
+		$LOGGER->fatal($@);
+		die $@;
 	}
 
-	my $qs = defined($query_string)?$query_string:$vhost;
-	my $response = "$http://". $vhost ." returned: ". $mech->response()->code() .'.';
-	if ($mech->response()->code() != 200) {
-		$code=2;
-	} else {
-		if (
-			($mech->content() !~ /$qs/) &&
-			($mech->content( format => 'text' ) !~ /$qs/) ){
-			$response .= ' Response did not match "'. $qs .'".';
-			$code = 3;
+	while (my $host = $sth->fetchrow_hashref()) {
+		next unless $host->{host_id} == 5;
+		my $pid = fork();
+		if ($pid) {
+			$servers[$pid] = 1;
+			$LOGGER->debug('New process ('. $pid .') started to handle '. $host->{name} .' vhosts');
+		} else {
+			process_server_vhosts($host->{host_id}, $host->{name});
+			exit 0;
 		}
-	}	
+	}
 
-	$logger->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $host .';'. 
-		$vhost .':'. $port .' on '. $host .';'. 
-		$code .';'. $response);
-
-	print '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
-		$vhost .':'. $port .' on '. $host .';'.
-		$code .';'. $response ."\n";
+	# Don't abandon your children
+	my $kid;
+	do {
+		$kid = wait;	
+		$LOGGER->debug('Process ('. $kid .') exited');
+	} while $kid > 0;
+	exit;
 }
-
 
 # We actually want to stay on the same server so we only chnage the HOST
 # and the path.
@@ -1117,39 +953,238 @@ sub debug_response {
 	close TMP;
 }
 
+# This method is responsible for timing and possibly invoking new threads to decrease the
+# turn around time on vhost checks up to a limit.
+sub process_server_vhosts {
+	my ($host_id, $hostname) = @_;
+	use Time::HiRes qw(usleep);
+	my $sleep = 0;
+	my $threads = 0;
+	my $total_time = 0;
+	my @children;
+	$SIG{USR1} = sub { print_statistics($host_id, $total_time, $sleep, $threads); };
+
+	# Set up the query
+	my $stv = $DBH->prepare(
+		"SELECT vhost.vhost_id,name,port,ip,query_string FROM vhost WHERE host_id = ?")
+		|| die "$DBI::errstr";
+
+	my $stva = $DBH->prepare(
+		"SELECT name FROM vhost_alias WHERE vhost_id = ?")
+		|| die "$DBI::errstr";
+
+	while (1) {
+		my $start = time();
+		# start processing vhosts and aliases
+		$stv->execute($host_id);
+		my $num_vhosts = 0;	
+
+		while (my $vhost = $stv->fetchrow_hashref()) {
+			$num_vhosts++;
+			if ($sleep) {
+				$LOGGER->debug("Sleeping for $sleep ms");
+				usleep($sleep);
+			} 
+
+			if ($threads) {
+				if ($#children == $threads) {
+					# wait for a kid to finish
+					my $kid = wait;
+					delete $children[$kid];
+				} 
+
+				# birth a new child
+				my $pid = fork();
+				if ($pid) {
+					$children[$pid] = 1;
+				} else {
+					check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
+					exit 0;
+				}
+			} else {
+				check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
+			}
+
+			$stva->execute($vhost->{vhost_id});
+			while (my $vhost_alias = $stva->fetchrow_hashref()) {
+				$num_vhosts++;
+				if ($sleep) {
+					usleep($sleep);
+				} elsif ($threads) {
+					if ($#children == $threads) {
+						# wait for a kid to finish
+						my $kid = wait;
+						delete $children[$kid];
+					} 
+
+					# birth a new child
+					my $pid = fork();
+					if ($pid) {
+						$children[$pid] = 1;
+					} else {
+						check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
+						exit 0;
+					}
+				} else {
+					check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
+				}
+			} # Loop all vhoost aliases
+		} # Loop all vhosts
+
+		my $end = time();
+		$total_time = $end-$start;
+		$LOGGER->debug($hostname .' loop took '. $total_time .' seconds');
+		# If the amount of time it took us to run / $num_hosts < $MAXTURNAROUNDTIME
+		# then update $sleep 
+		if ($total_time < $MAXTURNAROUNDTIME) {
+			if ($threads>0) {
+				$LOGGER->debug('DEBUG threads');
+				$threads--;
+				$LOGGER->debug('Decreasing threads used by '. $hostname .' from to '.  $threads);
+			} else {
+				if (($sleep+(10*1000000)) < ($MAXTURNAROUNDTIME*1000000)) {
+					$sleep = ($sleep+(10*1000000));
+				} else {
+					$sleep = $MAXTURNAROUNDTIME*1000000;
+				}
+				$LOGGER->debug("Setting sleep time between checks for $hostname to $sleep ms");
+			}
+
+		} 
+
+		# If not then it toook longer.
+		elsif ($sleep > 0) { 
+			# Back off by 10 seconds until we get to 0
+			if (($sleep-(10*1000000)) > 0) {
+				$sleep = ($sleep-10000000);
+			} else {
+				$sleep = 0; 
+			}
+		}
+		elsif ($threads == $MAXTHREADSPERHOST) {
+			$LOGGER->warn("The $hostname thread is behind by ". 
+				($MAXTURNAROUNDTIME-$total_time) ." seconds and is already using ".
+				$MAXTHREADSPERHOST ." threads"); }
+		else {
+			$threads++;
+			$LOGGER->debug('Increasing threads used by '. $hostname .' from to '. 
+				$threads);
+		}
+	} # Looping forever, alone and cold on the moon.  Nobody love me.
+	
+}
+
+sub check_host_fork {
+	my ($name, $ip, $port, $query_string, $hostname, @children) = @_;
+}
+
+sub check_host {
+	my ($name, $ip, $port, $query_string, $hostname) = @_;
+	$LOGGER->debug("check_host($name, $ip, $port, \$query_string, $hostname)");
+	my $code = 0;
+	my $http = 'http';
+	if ($port == 443) {
+		$http .= 's';
+	}
+
+	my $mech = WWW::Mechanize->new( 
+		ssl_opts => { 
+			verify_hostname => 0
+		} 
+	);
+
+	$hostname =~ /^([^\.]+)/;
+	my $short_hostname = $1;
+
+	$mech->add_header(HOST => $name);
+	# This should automatically handle redirects
+	eval {
+		$mech->get($http ."://$ip");
+	};
+	if ($@) {
+		$LOGGER->error("Issues: $@. vhost=$name");
+	}
+
+	my $response = "$http://$name returned: ". $mech->response()->code() .'.';
+	if ($mech->response()->code() != 200) {
+		$code=2;
+	} else {
+		if (
+			($mech->content() !~ /$query_string/) &&
+			($mech->content(format => 'text') !~ /$query_string/) ){
+			$response .= ' Response did not match "'. $query_string .'".';
+			$code = 3;
+		}
+	}	
+
+	$LOGGER->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'. 
+		$name .':'. $port .' on '. $hostname .';'. 
+		$code .';'. $response);
+
+	if (! open(CMD_FILE, '>>', $CMD_FILE)) {
+		$LOGGER->fatal("Could not open $CMD_FILE to append data to: $!");
+		die;
+	}
+	print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
+		$name .':'. $port .' on '. $hostname .';'.
+		$code .';'. $response ."\n";
+	close CMD_FILE;
+}
+
+# When this is trigered from process_server_vhosts it will cause the loop to 
+# jump out of the sleep if one is being issued.
 sub print_statistics {
 	use Log::Log4perl qw(:levels);
-	my ($logger) = @_;
+	my ($host_id, $time, $sleep, $threads) = @_;
 
 	# Make sure we are not called unless we are running in daemon mode
 	return if (!$DAEMON);
 
 	# Set up the queries
-	my $sth_hosts = $DBH->prepare(
-		"SELECT host.host_id,host.name,count(vhost.vhost_id) as vhosts from host ".
-		"LEFT JOIN vhost ON (vhost.host_id = host.host_id) ".
-		"GROUP BY host.host_id");
-
 	my $sth_vhosts = $DBH->prepare(
 		"SELECT vhost.vhost_id,vhost.name,count(vhost_alias.name) as vhost_aliases from vhost ".
 		"LEFT JOIN vhost_alias ON (vhost.vhost_id = vhost_alias.vhost_id) ".
 		"WHERE vhost.host_id = ? ".
 		"GROUP BY vhost.vhost_id");
 
+	my $sth_hosts;
+	if (defined ($host_id)) {
+		$sth_hosts = $DBH->prepare(
+			"SELECT host.host_id,host.name,count(vhost.vhost_id) as vhosts from host ".
+			"LEFT JOIN vhost ON (vhost.host_id = host.host_id) ".
+			"WHERE host.host_id = ? ".
+			"GROUP BY host.host_id");
+		$sth_hosts->execute($host_id);
+		
+	} else {
+		$sth_hosts = $DBH->prepare(
+			"SELECT host.host_id,host.name,count(vhost.vhost_id) as vhosts from host ".
+			"LEFT JOIN vhost ON (vhost.host_id = host.host_id) ".
+			"GROUP BY host.host_id");
+		$sth_hosts->execute();
+	}
+
 	# For each host print the number of vhosts and vhost_aliases we are checking
-	$sth_hosts->execute();
-	my $level = $logger->level();
-	$logger->level($INFO);
+	my $level = $LOGGER->level();
+	$LOGGER->level($INFO);
 	while (my $host = $sth_hosts->fetchrow_hashref()) {
 		my $vhost_aliases = 0;
 		$sth_vhosts->execute($host->{host_id});
 		while (my $vhost = $sth_vhosts->fetchrow_hashref()) {
 			$vhost_aliases += $vhost->{vhost_aliases};
 		}
-		$logger->info($host->{name} .' '. ($host->{vhosts}+$vhost_aliases) .' checks ('.
+		$LOGGER->info($host->{name} .' '. ($host->{vhosts}+$vhost_aliases) .' checks ('.
 			$host->{vhosts} .' vhosts, '. $vhost_aliases ." aliases)");
+
+		if ($host_id) {
+			$LOGGER->info($host->{name} .' has a RTT of '. $time .' seconds is using '.
+				'a sleep of '. $sleep .' micro seconds, and is utilizing '. $threads 
+				.' threads');
+		}
 	}
-	$logger->level($level);
+	
+
+	$LOGGER->level($level);
 
 	# TODO: Print the time between checks in average, std dev, max, and min
 }
