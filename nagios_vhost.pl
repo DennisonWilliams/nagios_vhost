@@ -968,7 +968,7 @@ sub process_server_vhosts {
 
 	# Set up the query
 	my $stv = $DBH->prepare(
-		"SELECT vhost.vhost_id,name,port,ip,query_string FROM vhost WHERE host_id = ?")
+		"SELECT vhost_id,name,port,ip,query_string FROM vhost WHERE host_id = ?")
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
