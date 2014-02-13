@@ -882,7 +882,6 @@ sub run_checks_as_daemon {
 	}
 
 	while (my $host = $sth->fetchrow_hashref()) {
-		next unless $host->{host_id} == 5;
 		my $pid = fork();
 		if ($pid) {
 			$servers[$pid] = 1;
@@ -1074,10 +1073,6 @@ sub process_server_vhosts {
 	
 }
 
-sub check_host_fork {
-	my ($name, $ip, $port, $query_string, $hostname, @children) = @_;
-}
-
 sub check_host {
 	my ($name, $ip, $port, $query_string, $hostname) = @_;
 	$LOGGER->debug("check_host($name, $ip, $port, \$query_string, $hostname)");
@@ -1183,10 +1178,7 @@ sub print_statistics {
 		}
 	}
 	
-
 	$LOGGER->level($level);
-
-	# TODO: Print the time between checks in average, std dev, max, and min
 }
 
 sub usage {
