@@ -566,7 +566,7 @@ sub collect_vhosts_from_webservers {
 		|| die "$DBI::errstr";;
 
 	$sth->execute();
-	my $get_vhosts_cmd = "sudo apachectl -t -D DUMP_VHOSTS";
+	my $get_vhosts_cmd = "PATH=\$PATH:/usr/sbin; sudo apachectl -t -D DUMP_VHOSTS";
 	my $get_config_file_cmd = "/bin/cat ";
 
 	while (my $host = $sth->fetchrow_hashref()) {
