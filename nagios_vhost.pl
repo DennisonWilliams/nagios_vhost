@@ -958,9 +958,9 @@ sub process_server_vhosts {
 	my ($host_id, $hostname) = @_;
 	use Time::HiRes qw(usleep);
 	my $sleep = 0;
-	my $threads = 0;
+	my $threads = 1;
 	my $total_time = 0;
-	my @children;
+	my %children;
 	$SIG{USR1} = sub { print_statistics($host_id, $total_time, $sleep, $threads); };
 
 	# Set up the query
@@ -985,17 +985,21 @@ sub process_server_vhosts {
 				usleep($sleep);
 			} 
 
-			if ($threads) {
-				if ($#children == $threads) {
+			if ($threads > 1) {
+				$LOGGER->debug('Running in threaded mode with '. $threads .' processes for the '. $hostname .' loop');
+				if (scalar(keys %children) == $threads) {
 					# wait for a kid to finish
+					$LOGGER->debug('Already have '. scalar(keys %children) .' processes for this loop, waiting for one to return');
 					my $kid = wait;
-					delete $children[$kid];
+					$LOGGER->debug($kid .' returned');
+					delete $children{$kid};
 				} 
 
 				# birth a new child
 				my $pid = fork();
 				if ($pid) {
-					$children[$pid] = 1;
+					$LOGGER->debug('Forked a new process ('. $pid .')');
+					$children{$pid} = 1;
 				} else {
 					check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
 					exit 0;
@@ -1009,17 +1013,20 @@ sub process_server_vhosts {
 				$num_vhosts++;
 				if ($sleep) {
 					usleep($sleep);
-				} elsif ($threads) {
-					if ($#children == $threads) {
+				} elsif ($threads>1) {
+					if (scalar(keys %children) == $threads) {
+						$LOGGER->debug('Already have '. scalar(keys %children) .' processes for this loop, waiting for one to return');
 						# wait for a kid to finish
 						my $kid = wait;
-						delete $children[$kid];
+						$LOGGER->debug($kid .' returned');
+						delete $children{$kid};
 					} 
 
 					# birth a new child
 					my $pid = fork();
 					if ($pid) {
-						$children[$pid] = 1;
+						$LOGGER->debug('Forked a new process ('. $pid .')');
+						$children{$pid} = 1;
 					} else {
 						check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
 						exit 0;
@@ -1030,16 +1037,22 @@ sub process_server_vhosts {
 			} # Loop all vhoost aliases
 		} # Loop all vhosts
 
+		# Reap all children for this loop if there are any
+		if ($threads>1) {
+			while (wait>0) {}
+			undef %children;
+			$LOGGER->debug('All forked processes for the '. $hostname .' process loop have been accounted for');
+		}
+
 		my $end = time();
 		$total_time = $end-$start;
 		$LOGGER->debug($hostname .' loop took '. $total_time .' seconds');
 		# If the amount of time it took us to run / $num_hosts < $MAXTURNAROUNDTIME
 		# then update $sleep 
 		if ($total_time < $MAXTURNAROUNDTIME) {
-			if ($threads>0) {
-				$LOGGER->debug('DEBUG threads');
+			if ($threads>1) {
 				$threads--;
-				$LOGGER->debug('Decreasing threads used by '. $hostname .' from to '.  $threads);
+				$LOGGER->debug('Decreasing threads used by '. $hostname .' from '. ($threads+1) .' to '.  $threads);
 			} else {
 				if (($sleep+(10*1000000)) < ($MAXTURNAROUNDTIME*1000000)) {
 					$sleep = (($sleep+(10*1000000)/$num_vhosts));
@@ -1066,8 +1079,7 @@ sub process_server_vhosts {
 				$MAXTHREADSPERHOST ." threads"); }
 		else {
 			$threads++;
-			$LOGGER->debug('Increasing threads used by '. $hostname .' from to '. 
-				$threads);
+			$LOGGER->debug('Increasing threads used by '. $hostname .' from '. ($threads-1) .' to '.  $threads);
 		}
 	} # Looping forever, alone and cold on the moon.  Nobody love me.
 	
