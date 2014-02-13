@@ -912,9 +912,7 @@ sub response_redirect {
 		$response->request()->as_string() =~ /GET\s+(http[^:]*):\/\/([^\/\s]+)/;
 		my $http = $1;
 		my $ip = $2;
-		print "response_redirect() recived Location header: ". 
-			$response->header('Location') ."\n"
-			if ($VERBOSE);
+		$LOGGER->debug("response_redirect() recived Location header: ". $response->header('Location'));
 		if ($response->header('Location') !~ /^http/) {
 			$url = $http .'://'. $ip;
 			if ($response->header('Location') !~ /^\//) {
@@ -923,14 +921,12 @@ sub response_redirect {
 			$url .= $response->header('Location');
 		} else {
 			$response->header('Location') =~ /(http[^:]*):\/\/([^\/]+)(\/.*)?/;
-			print "response_redirect() HOST header: $2\n"
-				if ($VERBOSE);
+			$LOGGER->debug("response_redirect() HOST header: $2");
 			$ua->add_header(HOST => $2);
 			$url = $1 .'://'. $ip . $3;
 		}
 
-		print "response_redirect() new url: $url\n"
-			if ($VERBOSE);
+		$LOGGER->debug("response_redirect() new url: $url");
 
 		# Update the uri with the Location Header value
 		# create and return a HTTP::Request object
@@ -940,16 +936,6 @@ sub response_redirect {
 		return HTTP::Request->new( "GET", $url);
 	}
 	return;
-}
-
-sub debug_response {
- 	my ($file_name, $content) = @_;
-	open (TMP, , '>', "/tmp/$file_name")
-		or die("Could not open /tmp/$file_name for writing");
-
-	print TMP $content;
-
-	close TMP;
 }
 
 # This method is responsible for timing and possibly invoking new threads to decrease the
@@ -1099,6 +1085,9 @@ sub check_host {
 			verify_hostname => 0
 		} 
 	);
+	$mech->add_handler('response_redirect' => \&response_redirect);
+	$mech->conn_cache(LWP::ConnCache->new);
+	$LOGGER->debug('Mechanize browser initialized');
 
 	$hostname =~ /^([^\.]+)/;
 	my $short_hostname = $1;
