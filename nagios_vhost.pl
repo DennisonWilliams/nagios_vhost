@@ -855,8 +855,7 @@ sub run_checks_as_daemon {
 
 	my @servers;
 	$SIG{TERM} = sub { 
-		my @kids = keys @servers;
-		kill 9, @kids;
+		kill 9, @servers;
 	};
 	
 	# With this handler does this mean that each child will inherit this? Yes,
@@ -884,7 +883,7 @@ sub run_checks_as_daemon {
 	while (my $host = $sth->fetchrow_hashref()) {
 		my $pid = fork();
 		if ($pid) {
-			$servers[$pid] = 1;
+			push @servers, $pid;
 			$LOGGER->debug('New process ('. $pid .') started to handle '. $host->{name} .' vhosts');
 		} else {
 			process_server_vhosts($host->{host_id}, $host->{name});
