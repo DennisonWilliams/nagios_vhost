@@ -1041,9 +1041,9 @@ sub process_server_vhosts {
 				$LOGGER->debug('Decreasing threads used by '. $hostname .' from to '.  $threads);
 			} else {
 				if (($sleep+(10*1000000)) < ($MAXTURNAROUNDTIME*1000000)) {
-					$sleep = ($sleep+(10*1000000));
+					$sleep = (($sleep+(10*1000000)/$num_vhosts));
 				} else {
-					$sleep = $MAXTURNAROUNDTIME*1000000;
+					$sleep = (($MAXTURNAROUNDTIME*1000000)/$num_vhosts);
 				}
 				$LOGGER->debug("Setting sleep time between checks for $hostname to $sleep ms");
 			}
