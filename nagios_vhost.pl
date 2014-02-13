@@ -881,6 +881,10 @@ sub run_checks_as_daemon {
 	}
 
 	while (my $host = $sth->fetchrow_hashref()) {
+		if ($host->{name} =~ '/blog-psaonl/') {
+			next;
+		}
+		$LOGGER->debug($host->{name});
 		my $pid = fork();
 		if ($pid) {
 			push @servers, $pid;
