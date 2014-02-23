@@ -57,7 +57,9 @@ sub response_redirect {
 		$response->request()->as_string() =~ /GET\s+(http[^:]*):\/\/([^\/\s]+)/;
 		my $http = $1;
 		my $ip = $2;
+		$LOGGER->debug("response_redirect() request header: ". $response->request()->as_string());
 		$LOGGER->debug("response_redirect() recived Location header: ". $response->header('Location'));
+		$LOGGER->debug("response_redirect() response header: ". $response->as_string());
 		if ($response->header('Location') !~ /^http/) {
 			$url = $http .'://'. $ip;
 			if ($response->header('Location') !~ /^\//) {
