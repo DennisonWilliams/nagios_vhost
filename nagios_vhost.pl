@@ -1004,7 +1004,9 @@ sub process_server_vhosts {
 				$num_vhosts++;
 				if ($sleep) {
 					usleep($sleep);
-				} elsif ($threads>1) {
+				} 
+
+				if ($threads>1) {
 					if (scalar(keys %children) == $threads) {
 						$LOGGER->debug('Already have '. scalar(keys %children) .' processes for this loop, waiting for one to return');
 						# wait for a kid to finish
