@@ -965,6 +965,7 @@ sub process_server_vhosts {
 		my $num_vhosts = 0;	
 
 		while (my $vhost = $stv->fetchrow_hashref()) {
+			$LOGGER->debug('process_server_vhosts(): Processing vhost '. $vhost->{name} .' for '. $hostname);
 			$num_vhosts++;
 			if ($sleep) {
 				$LOGGER->debug("Sleeping for $sleep ms");
@@ -996,6 +997,7 @@ sub process_server_vhosts {
 
 			$stva->execute($vhost->{vhost_id});
 			while (my $vhost_alias = $stva->fetchrow_hashref()) {
+				$LOGGER->debug('process_server_vhosts(): Processing vhost alias '. $vhost_alias->{name} .' for '. $hostname);
 				$num_vhosts++;
 				if ($sleep) {
 					usleep($sleep);
