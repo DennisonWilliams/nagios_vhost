@@ -6,7 +6,6 @@ use File::Basename;
 use DBI;
 use Data::Dumper;
 use Net::DNS;
-use Net::XWhois;
 
 my $DBFILE = dirname(abs_path($0)) .'/.nagios_vhost.pl.db';
 my $DBH = DBI->connect("dbi:SQLite:dbname=$DBFILE", "", "",{ 
@@ -27,20 +26,15 @@ $sth->execute();
 while (my $row = $sth->fetchrow_hashref()) {
 
 	foreach my $name (qw/vhost_name vhost_alias_name/) {
+		next if (!$row->{$name});
+		next if ($row->{$name} =~ /^meow/);
 		if (!$state{$row->{$name}}) {
 			$state{$row->{$name}} = 1;
-			my $res = Net::DNS::Resolver->new;
-			my $query = $res->search($row->{$name});
-			my $ip;
-			if ($query) {
-				foreach my $rr ($query->answer) {
-					next unless $rr->type eq "A" || $rr->type eq "CNAME";
-					$ip = $rr->address;
-
-					print "Server: ". $row->{'host_name'} .", vhost: ". $row->{$name} ." (". 
-						$row->{'ip'} .') has a a new ip: '. $ip ."\n"
-						if ($ip ne $row->{'ip'});
-				}
+			my $ip = getIp($row->{$name});
+			if ($ip) {
+				print "Server: ". $row->{'host_name'} .", vhost: ". $row->{$name} ." (". 
+					$row->{'ip'} .') has a a new ip: '. $ip ."\n"
+					if ($ip ne $row->{'ip'});
 			} else {
 				print "Server: ". $row->{'host_name'} .", vhost: ". $row->{$name} ." (". 
 					$row->{'ip'} .") no longer has an ip in DNS.\n";
@@ -49,4 +43,20 @@ while (my $row = $sth->fetchrow_hashref()) {
 	}
 	$ct++;
 }
+
 print "$ct\n";
+
+sub getIp {
+	my ($name) = @_;
+	my $res = Net::DNS::Resolver->new;
+	my $query = $res->search($name);
+	if ($query) {
+		foreach my $rr ($query->answer) {
+			return $rr->address
+				if ($rr->type eq "A");
+
+			return getIp($1)
+				if ($rr->string =~ /CNAME\s+(.*)\.$/);
+		}
+	}
+}
