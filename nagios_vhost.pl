@@ -339,6 +339,7 @@ package main;
 our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
+our ($UPDATEWEBSERVERS);
 
 # The max amount of time that can pass between checking vhosts in seconds
 $MAXTURNAROUNDTIME = 10*60;
@@ -360,6 +361,7 @@ my $result = GetOptions (
 	"get-web-servers" => \$GETWEBSERVERS,
 	"add-vhost-query-string:s" => \$ADDVHOSTQUERYSTRING,
 	"nagios-config-dir:s" => \$NAGIOSCONFIGDIR,
+	"update-web-servers:s" => \$UPDATEWEBSERVERS,
 	"daemon"    => \$DAEMON,
 	"use-nsca"    => \$USENSCA,
 	"external-command-file:s"    => \$CMD_FILE,
@@ -386,9 +388,11 @@ if ($ADDWEBSERVER) {
 	die "--query-string argument required"
 		if (!defined($QUERYSTRING));
 	add_vhost_query_string();
+} elsif (defined($UPDATEWEBSERVERS)) {
+	collect_vhosts_from_webservers($UPDATEWEBSERVERS);
+	generate_nagios_config_files($UPDATEWEBSERVERS);
 } else {
-	collect_vhosts_from_webservers();
-	generate_nagios_config_files();
+	usage();
 }
 
 sub initDB{
@@ -550,6 +554,7 @@ sub get_web_servers{
 # Add any new vhosts and associated alieas
 # Update any new aliases
 sub collect_vhosts_from_webservers {
+	my ($hosts) = @_;
 	my $sth = $DBH->prepare('SELECT host_id,name from host')
 		|| die "$DBI::errstr";;
 	my $stv = $DBH->prepare('SELECT * from vhost where host_id=?')
@@ -565,9 +570,28 @@ sub collect_vhosts_from_webservers {
 	my $stvi = $DBH->prepare('INSERT INTO vhost(host_id, name, port, ip) values(?, ?, ?, ?)')
 		|| die "$DBI::errstr";;
 
-	$sth->execute();
 	my $get_vhosts_cmd = "PATH=\$PATH:/usr/sbin; sudo apachectl -t -D DUMP_VHOSTS";
 	my $get_config_file_cmd = "/bin/cat ";
+
+	# If we are passed in a host list, then process it
+	if ($hosts ne '') {
+		my $query = 'SELECT host_id,name from host where ';
+		my $first = 1;
+		my @hosts;
+		foreach (split /,/, $hosts) {
+			push @hosts, $_;
+			if (!$first) { $query .= ' or '; }
+			else { $first = 0; }
+
+			$query .= 'name = ?';
+		}
+
+		$sth = $DBH->prepare($query);
+		$sth->execute(@hosts);
+
+	} else {
+		$sth->execute();
+	}
 
 	while (my $host = $sth->fetchrow_hashref()) {
 		my %vhosts;
@@ -759,6 +783,7 @@ sub add_vhost_query_string {
 }
 
 sub generate_nagios_config_files {
+	my ($hosts) = @_;
 	my $sth = $DBH->prepare("SELECT host_id,name from host")
 		|| die "$DBI::errstr";
 
@@ -773,7 +798,27 @@ sub generate_nagios_config_files {
 	# Create a new config file for each host
 	# The format of the config file is our modified version of the check_vhosts
 	# script: http://exchange.nagios.org/directory/Plugins/Web-Servers/check_vhosts/details
-	$sth->execute();
+
+	# If we are passed in a host list, then process it
+	if ($hosts ne '') {
+		my $query = 'SELECT host_id,name from host where ';
+		my $first = 1;
+		my @hosts;
+		foreach (split /,/, $hosts) {
+			push @hosts, $_;
+			if (!$first) { $query .= ' or '; }
+			else { $first = 0; }
+
+			$query .= 'name = ?';
+		}
+
+		$sth = $DBH->prepare($query);
+		$sth->execute(@hosts);
+
+	} else {
+		$sth->execute();
+	}
+
 	while (my $host = $sth->fetchrow_hashref()) {
 		# TODO: do this
 		$host->{name} =~ /^([^\.]+)/;
@@ -1219,6 +1264,11 @@ webservers for vhosts, and will update the nagios vhost config files.
 --external-command-file <file>     : The externaal command file to write 
                                      nagios results to.  Default is
                                      /var/lib/nagios3/rw/nagios.cmd
+--update-web-servers [server_list] : Log into each of the web servers 
+                                     specified in the optional comma seperated
+                                     list of [server_list].  If [server_list] 
+                                     is not specified then poll all web servers
+                                     configured in the db.
 --verbose                          : Repeat this option to increase verbosity
 --help                             : This help message
 END
