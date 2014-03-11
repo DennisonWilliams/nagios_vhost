@@ -932,6 +932,7 @@ sub run_checks_as_daemon {
 			$servers[$pid] = 1;
 			$LOGGER->debug('New process ('. $pid .') started to handle '. $host->{name} .' vhosts');
 		} else {
+			$0 = $0 ." [". $host->{name} ."]";
 			process_server_vhosts($host->{host_id}, $host->{name});
 			exit 0;
 		}
