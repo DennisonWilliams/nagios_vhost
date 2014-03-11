@@ -440,12 +440,14 @@ sub initDB{
 	}
 
 	# Upgrade starts here
-	#my $st_schema = $DBH->prepare('UPDATE variables set value = ? where key = ?');
-	#if ($schema_version == 1) { 
+	my $st_schema = $DBH->prepare('UPDATE variables set value = ? where key = ?');
+	if ($schema_version == 1) { 
 		# Perform some DB upgrade operations here
-		#$st_schema->execute('2', 'schema_version');		
-		#$schema_version = 2;
-	#}
+		$sth = $DBH->prepare("alter table vhost add column response INT NOT NULL DEFAULT 200");
+		
+		$st_schema->execute('2', 'schema_version');		
+		$schema_version = 2;
+	}
 }
 
 sub install {
@@ -997,7 +999,7 @@ sub process_server_vhosts {
 
 	# Set up the query
 	my $stv = $DBH->prepare(
-		"SELECT vhost_id,name,port,ip,query_string FROM vhost WHERE host_id = ?")
+		"SELECT vhost_id,name,port,ip,query_string,response FROM vhost WHERE host_id = ?")
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
@@ -1034,11 +1036,13 @@ sub process_server_vhosts {
 					$LOGGER->debug('Forked a new process ('. $pid .')');
 					$children{$pid} = 1;
 				} else {
-					check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
+					check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, 
+						$vhost->{query_string}, $hostname, $vhost->{response});
 					exit 0;
 				}
 			} else {
-				check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
+				check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, 
+					$vhost->{query_string}, $hostname, $vhost->{response});
 			}
 
 			$stva->execute($vhost->{vhost_id});
@@ -1122,7 +1126,7 @@ sub process_server_vhosts {
 }
 
 sub check_host {
-	my ($name, $ip, $port, $query_string, $hostname) = @_;
+	my ($name, $ip, $port, $query_string, $hostname, $rc) = @_;
 	$LOGGER->debug("check_host($name, $ip, $port, \$query_string, $hostname)");
 	my $code = 0;
 	my $http = 'http';
@@ -1152,7 +1156,7 @@ sub check_host {
 	}
 
 	my $response = "$http://$name returned: ". $mech->response()->code() .'.';
-	if ($mech->response()->code() != 200) {
+	if ($mech->response()->code() != $rc) {
 		$code=2;
 	} else {
 		if (
