@@ -339,7 +339,7 @@ package main;
 our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
-our ($UPDATEWEBSERVERS);
+our ($UPDATEWEBSERVERS, @LOCATIONS);
 
 # The max amount of time that can pass between checking vhosts in seconds
 $MAXTURNAROUNDTIME = 10*60;
@@ -424,7 +424,7 @@ sub initDB{
 	if (defined($DBI::errstr) && $DBI::errstr =~ /no such table/) {
 		install();
 		$sth = $DBH->prepare("INSERT INTO variables(`key`, `value`) values(?, ?)");
-		$sth->execute('schema_version', 1);
+		$sth->execute('schema_version', 3);
 	} else {
 	
 		$sth->execute();
@@ -435,7 +435,7 @@ sub initDB{
 		if (!defined($schema_version)) {
 				install();
 				$sth = $DBH->prepare("INSERT INTO variables(`key`, `value`) values(?, ?)");
-				$sth->execute('schema_version', 1);
+				$sth->execute('schema_version', 3);
 		}
 	}
 
@@ -443,11 +443,49 @@ sub initDB{
 	my $st_schema = $DBH->prepare('UPDATE variables set value = ? where key = ?');
 	if ($schema_version == 1) { 
 		# Perform some DB upgrade operations here
-		$sth = $DBH->prepare("alter table vhost add column response INT NOT NULL DEFAULT 200");
+		$sth = $DBH->prepare( "ALTER TABLE vhost ADD COLUMN response INT NOT NULL DEFAULT 200" );
+		$sth->execute();
 		
 		$st_schema->execute('2', 'schema_version');		
 		$schema_version = 2;
 	}
+
+	if ($schema_version == 2) { 
+		# Perform some DB upgrade operations here
+		$sth = $DBH->prepare(
+			"CREATE TABLE redirections (
+				vhost_id INTEGER,
+				redirection VARCHAR,
+				FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
+			)"
+		);
+		$sth->execute();
+
+		$sth = $DBH->prepare(
+			"CREATE TABLE variables2 (
+				`key` VARCHAR(255) NOT NULL,
+				`value` VARCHAR(255),
+				PRIMARY KEY (`key`)
+		)");
+		$sth->execute();
+
+		my $stsh = $DBH->prepare("SELECT * from variables");
+		my $stih = $DBH->prepare("INSERT INTO variables2(`key`, `value`) values(?, ?)");
+		$stsh->execute();
+		while (my $var = $stsh->fetchrow_hashref()) {
+			$stih->execute($var->{key}, $var->{value});
+		}
+
+		$sth = $DBH->prepare("DROP TABLE variables");
+		$sth->execute();
+			
+		$sth = $DBH->prepare("ALTER TABLE variables2 RENAME TO variables");
+		$sth->execute();
+			
+		$st_schema->execute('3', 'schema_version');		
+		$schema_version = 3;
+	}
+
 }
 
 sub install {
@@ -488,6 +526,7 @@ sub install {
 			name VARCHAR(255),
 			ip VARCHAR(15),
 			port INT NOT NULL DEFAULT 80,
+			response INT NOT NULL DEFAULT 200,
 			query_string VARCHAR(255),
 			FOREIGN KEY(host_id) REFERENCES host(host_id) ON DELETE CASCADE
 	)");
@@ -499,6 +538,15 @@ sub install {
 			vhost_id INTEGER,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255),
+			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
+	)");
+	$sth->execute();
+	$sth->finish();
+
+	$sth = $DBH->prepare(
+		"CREATE TABLE redirections (
+			vhost_id INTEGER,
+			redirection VARCHAR(255),
 			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
 	)");
 	$sth->execute();
@@ -960,6 +1008,7 @@ sub response_redirect {
 
 	my $url;
 	if ($response->header('Location')) {
+		push @LOCATIONS, $response->header('Location');
 		$response->request()->as_string() =~ /GET\s+(http[^:]*):\/\/([^\/\s]+)/;
 		my $http = $1;
 		my $ip = $2;
@@ -1002,7 +1051,9 @@ sub process_server_vhosts {
 
 	# Set up the query
 	my $stv = $DBH->prepare(
-		"SELECT vhost_id,name,port,ip,query_string,response FROM vhost WHERE host_id = ?")
+		"SELECT vhost.vhost_id,name,port,ip,query_string,response,redirections.redirection FROM vhost ".
+		"LEFT JOIN redirections ON (redirections.vhost_id = vhost.vhost_id) ".
+		"WHERE host_id = ? ")
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
@@ -1040,12 +1091,14 @@ sub process_server_vhosts {
 					$children{$pid} = 1;
 				} else {
 					check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, 
-						$vhost->{query_string}, $hostname, $vhost->{response});
+						$vhost->{query_string}, $hostname, $vhost->{response}, 
+						$vhost->{redirection});
 					exit 0;
 				}
 			} else {
 				check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, 
-					$vhost->{query_string}, $hostname, $vhost->{response});
+					$vhost->{query_string}, $hostname, $vhost->{response},
+					$vhost->{redirection});
 			}
 
 			$stva->execute($vhost->{vhost_id});
@@ -1071,11 +1124,15 @@ sub process_server_vhosts {
 						$LOGGER->debug('Forked a new process ('. $pid .')');
 						$children{$pid} = 1;
 					} else {
-						check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
+						check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
+							$vhost->{query_string}, $hostname, $vhost->{response},
+							$vhost->{redirection});
 						exit 0;
 					}
 				} else {
-					check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, $vhost->{query_string}, $hostname);
+					check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
+						$vhost->{query_string}, $hostname, $vhost->{response},
+						$vhost->{redirection});
 				}
 			} # Loop all vhoost aliases
 		} # Loop all vhosts
@@ -1129,7 +1186,7 @@ sub process_server_vhosts {
 }
 
 sub check_host {
-	my ($name, $ip, $port, $query_string, $hostname, $rc) = @_;
+	my ($name, $ip, $port, $query_string, $hostname, $rc, $redirection) = @_;
 	$LOGGER->debug("check_host($name, $ip, $port, \$query_string, $hostname)");
 	my $code = 0;
 	my $http = 'http';
@@ -1151,6 +1208,7 @@ sub check_host {
 
 	$mech->add_header(HOST => $name);
 	# This should automatically handle redirects
+	@LOCATIONS = ();
 	eval {
 		$mech->get($http ."://$ip");
 	};
@@ -1158,17 +1216,24 @@ sub check_host {
 		$LOGGER->error("Issues: $@. vhost=$name");
 	}
 
-	my $response = "$http://$name returned: ". $mech->response()->code() .'.';
-	if ($mech->response()->code() != $rc) {
-		$code=2;
+	my $response = "$http://$name returned: ";
+
+	# TODO: is this a problem with the special characters in a url?
+	if ($redirection && grep(/$redirection/, @LOCATIONS)) {
+		$response .= ' 302 to expected location: '. $redirection;
 	} else {
-		if (
-			($mech->content() !~ /$query_string/) &&
-			($mech->content(format => 'text') !~ /$query_string/) ){
-			$response .= ' Response did not match "'. $query_string .'".';
-			$code = 3;
-		}
-	}	
+		$response .= $mech->response()->code() .'.';
+		if ($mech->response()->code() != $rc) {
+			$code=2;
+		} else {
+			if (
+				($mech->content() !~ /$query_string/) &&
+				($mech->content(format => 'text') !~ /$query_string/) ){
+				$response .= ' Response did not match "'. $query_string .'".';
+				$code = 3;
+			} #if
+		}	#else
+	} #else
 
 	$LOGGER->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'. 
 		$name .':'. $port .' on '. $hostname .';'. 
