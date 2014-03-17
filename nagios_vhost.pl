@@ -1236,8 +1236,13 @@ sub check_host {
 	my $response = "$http://$name returned: ";
 
 	# TODO: is this a problem with the special characters in a url?
-	if ($LOCATION eq 'matched') {
+	if ($LOCATION ne 'matched' && $rc == '302' ) {
+		$response .= ' Did NOT 302 to expected location: '. $query_string;
+		$code=2;
+	} elsif ($LOCATION eq 'matched' && $rc == '302') {
 		$response .= ' 302 to expected location: '. $query_string;
+	} elsif($rc != '200' && $rc == $mech->response()->code()) {
+		$response .= " expected $rc";
 	} else {
 		$response .= $mech->response()->code() .'.';
 		if ($mech->response()->code() != $rc) {
