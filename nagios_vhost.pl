@@ -339,7 +339,7 @@ package main;
 our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
-our ($UPDATEWEBSERVERS, @LOCATIONS);
+our ($UPDATEWEBSERVERS, $LOCATION);
 
 # The max amount of time that can pass between checking vhosts in seconds
 $MAXTURNAROUNDTIME = 10*60;
@@ -486,6 +486,22 @@ sub initDB{
 		$schema_version = 3;
 	}
 
+	if ($schema_version == 3) {
+		$sth = $DBH->prepare("SELECT * from redirections");
+		$sth->execute;
+
+		my $stvu = $DBH->prepare("UPDATE vhost SET query_string = ? where vhost_id = ?");
+		while (my $rrow = $sth->fetchrow_hashref()) {
+			$stvu->execute($rrow->{'redirection'}, $rrow->{'vhost_id'});
+		}
+
+		$sth = $DBH->prepare("DROP TABLE redirections");
+		$sth->execute();
+
+		$st_schema->execute('4', 'schema_version');		
+		$schema_version = 4;
+	}
+
 }
 
 sub install {
@@ -538,15 +554,6 @@ sub install {
 			vhost_id INTEGER,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255),
-			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
-	)");
-	$sth->execute();
-	$sth->finish();
-
-	$sth = $DBH->prepare(
-		"CREATE TABLE redirections (
-			vhost_id INTEGER,
-			redirection VARCHAR(255),
 			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
 	)");
 	$sth->execute();
@@ -1008,7 +1015,15 @@ sub response_redirect {
 
 	my $url;
 	if ($response->header('Location')) {
-		push @LOCATIONS, $response->header('Location');
+
+		# This is an ugly fix, but to help keep us from ending up in the 
+		# redirection loop then we need to check against a possible 
+		# redirection location set in the check_host method.
+		if ($response->header('Location') eq $LOCATION) {
+			$LOCATION = 'matched';
+			return;
+		}
+
 		$response->request()->as_string() =~ /GET\s+(http[^:]*):\/\/([^\/\s]+)/;
 		my $http = $1;
 		my $ip = $2;
@@ -1051,9 +1066,8 @@ sub process_server_vhosts {
 
 	# Set up the query
 	my $stv = $DBH->prepare(
-		"SELECT vhost.vhost_id,name,port,ip,query_string,response,redirections.redirection FROM vhost ".
-		"LEFT JOIN redirections ON (redirections.vhost_id = vhost.vhost_id) ".
-		"WHERE host_id = ? ")
+		"SELECT vhost.vhost_id,name,port,ip,query_string,response FROM vhost ".
+		"WHERE host_id = ?")
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
@@ -1091,14 +1105,12 @@ sub process_server_vhosts {
 					$children{$pid} = 1;
 				} else {
 					check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, 
-						$vhost->{query_string}, $hostname, $vhost->{response}, 
-						$vhost->{redirection});
+						$vhost->{query_string}, $hostname, $vhost->{response});
 					exit 0;
 				}
 			} else {
 				check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, 
-					$vhost->{query_string}, $hostname, $vhost->{response},
-					$vhost->{redirection});
+					$vhost->{query_string}, $hostname, $vhost->{response});
 			}
 
 			$stva->execute($vhost->{vhost_id});
@@ -1125,14 +1137,12 @@ sub process_server_vhosts {
 						$children{$pid} = 1;
 					} else {
 						check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
-							$vhost->{query_string}, $hostname, $vhost->{response},
-							$vhost->{redirection});
+							$vhost->{query_string}, $hostname, $vhost->{response});
 						exit 0;
 					}
 				} else {
 					check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
-						$vhost->{query_string}, $hostname, $vhost->{response},
-						$vhost->{redirection});
+						$vhost->{query_string}, $hostname, $vhost->{response});
 				}
 			} # Loop all vhoost aliases
 		} # Loop all vhosts
@@ -1186,8 +1196,8 @@ sub process_server_vhosts {
 }
 
 sub check_host {
-	my ($name, $ip, $port, $query_string, $hostname, $rc, $redirection) = @_;
-	$LOGGER->debug("check_host($name, $ip, $port, \$query_string, $hostname)");
+	my ($name, $ip, $port, $query_string, $hostname, $rc) = @_;
+	$LOGGER->debug("check_host($name, $ip, $port, \$query_string, $hostname, $rc)");
 	my $code = 0;
 	my $http = 'http';
 	if ($port == 443) {
@@ -1207,8 +1217,15 @@ sub check_host {
 	my $short_hostname = $1;
 
 	$mech->add_header(HOST => $name);
-	# This should automatically handle redirects
-	@LOCATIONS = ();
+
+	# This is a hack for passing data back and forth betwee the redirection
+	# handler, as we want to exit the handler as soon as there is a match of
+	# the redirection;
+	if ($query_string && $rc == '302') {
+		$LOCATION = $query_string;
+	} else {
+		$LOCATION = $query_string;
+	}
 	eval {
 		$mech->get($http ."://$ip");
 	};
@@ -1219,19 +1236,23 @@ sub check_host {
 	my $response = "$http://$name returned: ";
 
 	# TODO: is this a problem with the special characters in a url?
-	if ($redirection && grep(/$redirection/, @LOCATIONS)) {
-		$response .= ' 302 to expected location: '. $redirection;
+	if ($LOCATION eq 'matched') {
+		$response .= ' 302 to expected location: '. $query_string;
 	} else {
 		$response .= $mech->response()->code() .'.';
 		if ($mech->response()->code() != $rc) {
 			$code=2;
 		} else {
 			if (
+				$query_string &&
 				($mech->content() !~ /$query_string/) &&
 				($mech->content(format => 'text') !~ /$query_string/) ){
 				$response .= ' Response did not match "'. $query_string .'".';
 				$code = 3;
 			} #if
+			else {
+				$response .= ' Response matched "'. $query_string .'".';
+			} #else
 		}	#else
 	} #else
 
