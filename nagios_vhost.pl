@@ -1218,7 +1218,7 @@ sub check_host {
 	# This is a hack for passing data back and forth betwee the redirection
 	# handler, as we want to exit the handler as soon as there is a match of
 	# the redirection;
-	if ($query_string && $rc == '302') {
+	if ($query_string && $rc =~ /3\d\d/) {
 		$LOCATION = $query_string;
 	} else {
 		$LOCATION = $query_string;
@@ -1233,11 +1233,11 @@ sub check_host {
 	my $response = "$http://$name returned: ";
 
 	# TODO: is this a problem with the special characters in a url?
-	if ($LOCATION ne 'matched' && $rc == '302' ) {
-		$response .= ' Did NOT 302 to expected location: '. $query_string;
+	if ($LOCATION ne 'matched' && $rc =~ /3\d\d/ ) {
+		$response .= " Did NOT $rc to expected location: $query_string";
 		$code=2;
-	} elsif ($LOCATION eq 'matched' && $rc == '302') {
-		$response .= ' 302 to expected location: '. $query_string;
+	} elsif ($LOCATION eq 'matched' && $rc =~ /3\d\d/) {
+		$response .= " $rc to expected location: $query_string";
 	} elsif($rc != '200' && $rc == $mech->response()->code()) {
 		$response .= " expected $rc";
 	} else {
