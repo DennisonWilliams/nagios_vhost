@@ -1,12 +1,15 @@
 #!/usr/bin/perl
+use Data::Dumper;
 use WWW::Mechanize;
 use Getopt::Long;
 use Log::Log4perl qw(get_logger :levels);
 
-my ($VHOST, $IP);
+my ($VHOST, $IP, $SSL);
+$SSL = 0;
 my $result = GetOptions (
 	"vhost:s" => \$VHOST,
-	"ip:s"    => \$IP
+	"ip:s"    => \$IP,
+	"ssl"			=> \$SSL
 );
 
 if (!$VHOST) {
@@ -37,8 +40,11 @@ if ($IP) {
 
 # This should automatically handle redirects
 eval {
-	$LOGGER->debug("http://$get ($VHOST)");
-	$mech->get("http://$get");
+	my $query = 'http';
+	$query .= 's' if ($SSL);
+	$query .= '://'. $get;
+	$LOGGER->debug("$query ($VHOST)");
+	$mech->get($query);
 };
 if ($@) {
 	$LOGGER->error("Issues: $@. $get");
@@ -57,9 +63,8 @@ sub response_redirect {
 		$response->request()->as_string() =~ /GET\s+(http[^:]*):\/\/([^\/\s]+)/;
 		my $http = $1;
 		my $ip = $2;
-		$LOGGER->debug("response_redirect() request header: ". $response->request()->as_string());
-		$LOGGER->debug("response_redirect() recived Location header: ". $response->header('Location'));
-		$LOGGER->debug("response_redirect() response header: ". $response->as_string());
+		$LOGGER->debug("response_redirect() recived Location header (".
+			$response->code() ."): ". $response->header('Location'));
 		if ($response->header('Location') !~ /^http/) {
 			$url = $http .'://'. $ip;
 			if ($response->header('Location') !~ /^\//) {
@@ -68,7 +73,8 @@ sub response_redirect {
 			$url .= $response->header('Location');
 		} else {
 			$response->header('Location') =~ /(http[^:]*):\/\/([^\/]+)(\/.*)?/;
-			$LOGGER->debug("response_redirect() HOST header: $2");
+			$LOGGER->debug("response_redirect() HOST header (".
+				$response->code() ."): $2");
 			$ua->add_header(HOST => $2);
 			$url = $1 .'://'. $ip . $3;
 		}
