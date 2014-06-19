@@ -146,11 +146,6 @@ sub parse_file {
     # Collapse any ending whitespace to a single space.
     s#\s+$# #;
 
-    # If the line begins with a #, then skip the line.
-    if (substr($_, 0, 1) eq '#') {
-      next;
-    }
-
     # If there is nothing on the line, then skip it.
     next unless length $_;
 
@@ -204,6 +199,14 @@ sub parse_file {
 
       next;
     }
+
+		# Add comments 
+		if (/^\s*#\s*(\S.*)$/) {
+			my $comment = $1;
+			$new_node->name('comment');
+			$new_node->value($comment);
+			next;
+		}
 
     # Anything else at this point is a normal directive.  Split the
     # line into the directive name and a value.  Make sure not to
@@ -511,6 +514,21 @@ sub initDB{
 		$schema_version = 5;
 	}
 
+	if ($schema_version == 5) {
+		$sth = $DBH->prepare(
+			"CREATE TABLE vhost_url (
+				vhost_id INTEGER,
+				name VARCHAR(255),
+				path VARCHAR(255),
+				response INT NOT NULL DEFAULT 200,
+				query_string VARCHAR(255),
+				FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
+		)");
+		$sth->execute();
+		$st_schema->execute('6', 'schema_version');		
+		$schema_version = 6;
+	}
+
 }
 
 sub install {
@@ -563,6 +581,18 @@ sub install {
 			vhost_id INTEGER,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255),
+			response INT NOT NULL DEFAULT 200,
+			query_string VARCHAR(255),
+			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
+	)");
+	$sth->execute();
+	$sth->finish();
+
+	$sth = $DBH->prepare(
+		"CREATE TABLE vhost_url (
+			vhost_id INTEGER,
+			name VARCHAR(255),
+			path VARCHAR(255),
 			response INT NOT NULL DEFAULT 200,
 			query_string VARCHAR(255),
 			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
@@ -633,9 +663,13 @@ sub collect_vhosts_from_webservers {
 		|| die "$DBI::errstr";;
 	my $stvad = $DBH->prepare('DELETE from vhost_alias where vhost_id=?')
 		|| die "$DBI::errstr";;
+	my $stud = $DBH->prepare('DELETE from vhost_url where vhost_id=?')
+		|| die "$DBI::errstr";;
 	my $stvai = $DBH->prepare('INSERT INTO vhost_alias(vhost_id, name) values(?, ?)')
 		|| die "$DBI::errstr";;
 	my $stvi = $DBH->prepare('INSERT INTO vhost(host_id, name, port, ip) values(?, ?, ?, ?)')
+		|| die "$DBI::errstr";;
+	my $stvui = $DBH->prepare('INSERT INTO vhost_url(vhost_id, name, path, response, query_string) values(?, ?, ?, ?, ?)')
 		|| die "$DBI::errstr";;
 
 	my $get_vhosts_cmd = "PATH=\$PATH:/usr/sbin; sudo apachectl -t -D DUMP_VHOSTS";
@@ -710,6 +744,7 @@ sub collect_vhosts_from_webservers {
 			# vhost configs may still not include it!
 			my @aliases;
 			foreach my $sn ($acp->find_down_directive_names('servername')) {
+				my @server_comments = $acp->find_siblings_directive_names($sn, 'comment');
 				my @server_aliases = $acp->find_siblings_directive_names($sn, 'serveralias');
 				my @virtual_hosts = $acp->find_siblings_and_up_directive_names($sn, 'virtualhost');
 				my $server_name  = $sn->value;
@@ -728,6 +763,13 @@ sub collect_vhosts_from_webservers {
 					foreach my $alias (split(/\s+/, $sav)) {
 						$alias =~ s/^\*/meow/;
 						push(@aliases, $alias);
+					}
+				}
+
+				foreach my $comment (@server_comments) {
+					if (my ($url, $response, $qs) = $comment->value =~ /^monitor (\S+)(?:\s(\d+))?(?:\s(\S.*))?$/i) {
+						$vhosts{$vhost}{$port}{urls}{$url}{'response'} = ($response =~ /\d{3}/) ? $response : 200;
+						$vhosts{$vhost}{$port}{urls}{$url}{'query_string'} = $qs ? $qs : '';
 					}
 				}
 			}
@@ -761,6 +803,21 @@ sub collect_vhosts_from_webservers {
 			foreach(@{$vhosts{$vhost->{name}}{$vhost->{port}}{aliases}}) {
 			  print "\tInserting ". $_ ." as alias for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;	
 				$stvai->execute($vhost->{vhost_id}, $_);
+			}
+
+			# We just remove the urls and add the ones we found
+			print "\tRemoving urls for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
+			$stud->execute($vhost->{vhost_id});
+
+			foreach my $url (keys %{$vhosts{$vhost->{name}}{$vhost->{port}}{urls}}) {
+				$url =~ /([^\/]*)(\/.*)/;
+				my $name = $1 ? $1 : $vhost->{name};
+				my $path = $2;
+				my $response = $vhosts{$vhost->{name}}{$vhost->{port}}{urls}{$url}{response};
+				my $query_string = $vhosts{$vhost->{name}}{$vhost->{port}}{urls}{$url}{query_string};
+			  print "\tInserting $url as url for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
+				
+				$stvui->execute($vhost->{vhost_id}, $name, $path, $response, $query_string);
 			}
 			delete($vhosts{$vhost->{name}}{$vhost->{port}});
 		}
@@ -863,6 +920,10 @@ sub generate_nagios_config_files {
 		"SELECT name FROM vhost_alias WHERE vhost_id = ?")
 		|| die "$DBI::errstr";
 
+	my $stvu = $DBH->prepare(
+		"SELECT name,path FROM vhost_url WHERE vhost_id = ?")
+		|| die "$DBI::errstr";
+
 	# Create a new config file for each host
 	# The format of the config file is our modified version of the check_vhosts
 	# script: http://exchange.nagios.org/directory/Plugins/Web-Servers/check_vhosts/details
@@ -924,6 +985,23 @@ sub generate_nagios_config_files {
 					"\tservice_description HTTP\n".
 					"\tdependent_host_name $short_hostname\n".
 					"\tdependent_service_description ". $vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
+					"\texecution_failure_criteria n\n".
+					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
+			}
+
+			$stvu->execute($vhost->{vhost_id});
+			while (my $vuhost = $stvu->fetchrow_hashref()) {
+				print HOSTFILE "define service {\n".
+					"\tuse generic-service-passive-no-notification-no-perfdata\n".
+					"\tservice_description ". $vuhost->{name} .':'. $vhost->{port} . $vuhost->{path} .' on '. $host->{name} ."\n".
+					"\tservicegroups ". $host->{name} ."_urls\n".
+					"\thost_name $short_hostname\n}\n\n";
+
+				print HOSTFILE "define servicedependency {\n".
+					"\thost_name $short_hostname\n".
+					"\tservice_description HTTP\n".
+					"\tdependent_host_name $short_hostname\n".
+					"\tdependent_service_description ". $vuhost->{name} .':'. $vhost->{port} . $vuhost->{path} .' on '. $host->{name} ."\n".
 					"\texecution_failure_criteria n\n".
 					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
 			}
@@ -1082,6 +1160,12 @@ sub process_server_vhosts {
 		"SELECT name,query_string,response FROM vhost_alias WHERE vhost_id = ?")
 		|| die "$DBI::errstr";
 
+	my $stu = $DBH->prepare(
+		"SELECT name,path,query_string,response ".
+		"FROM vhost_url ".
+		"WHERE vhost_id = ?")
+		|| die "$DBI::errstr";
+
 	while (1) {
 		my $start = time();
 		# start processing vhosts and aliases
@@ -1152,9 +1236,44 @@ sub process_server_vhosts {
 					my $query_string = $vhost_alias->{query_string} ? $vhost_alias->{query_string} : $vhost->{query_string};
 					my $response = $vhost_alias->{response} ? $vhost_alias->{response} : $vhost->{response};
 					check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
-						$query_string, $response);
+						$query_string, $hostname, $response);
 				}
-			} # Loop all vhoost aliases
+			} # Loop all vhost aliases
+
+			$stu->execute($vhost->{vhost_id});
+			while (my $vhost_url = $stu->fetchrow_hashref()) {
+				$LOGGER->debug('process_server_vhosts(): Processing vhost url '. $vhost_url->{name} . $vhost_url->{path} .' for '. $hostname);
+				$num_vhosts++;
+				if ($sleep) {
+					usleep($sleep);
+				} 
+
+				if ($threads>1) {
+					if (scalar(keys %children) == $threads) {
+						$LOGGER->debug('Already have '. scalar(keys %children) .' processes for this loop, waiting for one to return');
+						# wait for a kid to finish
+						my $kid = wait;
+						$LOGGER->debug($kid .' returned');
+						delete $children{$kid};
+					} 
+
+					# birth a new child
+					my $pid = fork();
+					if ($pid) {
+						$LOGGER->debug('Forked a new process ('. $pid .')');
+						$children{$pid} = 1;
+					} else {
+						check_host($vhost_url->{name}, $vhost->{ip}, $vhost->{port}, 
+							$vhost_url->{query_string}, $hostname, $vhost_url->{response});
+						exit 0;
+					}
+				} else {
+					my $query_string = $vhost_url->{query_string} ? $vhost_url->{query_string} : $vhost->{query_string};
+					my $response = $vhost_url->{response} ? $vhost_url->{response} : $vhost->{response};
+					check_host($vhost_url->{name}, $vhost->{ip}, $vhost->{port}, 
+						$query_string, $hostname, $response, $vhost_url->{path});
+				}
+			} # Loop all vhost urls
 		} # Loop all vhosts
 
 		# Reap all children for this loop if there are any
@@ -1206,8 +1325,8 @@ sub process_server_vhosts {
 }
 
 sub check_host {
-	my ($name, $ip, $port, $query_string, $hostname, $rc) = @_;
-	$LOGGER->debug("check_host($name, $ip, $port, \$query_string, $hostname, $rc)");
+	my ($name, $ip, $port, $query_string, $hostname, $rc, $path) = @_;
+	$LOGGER->debug("check_host($name, $ip, $port, \$query_string, $hostname, $rc, $path)");
 	my $code = 0;
 	my $http = 'http';
 	if ($port == 443) {
@@ -1237,7 +1356,7 @@ sub check_host {
 		$LOCATION = $query_string;
 	}
 	eval {
-		$mech->get($http ."://$ip");
+		$mech->get($http ."://$ip$path");
 	};
 	if ($@) {
 		$LOGGER->error("Issues: $@. vhost=$name");
@@ -1272,7 +1391,7 @@ sub check_host {
 	} #else
 
 	$LOGGER->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'. 
-		$name .':'. $port .' on '. $hostname .';'. 
+		$name .':'. $port . $path .' on '. $hostname .';'. 
 		$code .';'. $response);
 
 	if (! open(CMD_FILE, '>>', $CMD_FILE)) {
@@ -1280,7 +1399,7 @@ sub check_host {
 		die;
 	}
 	print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
-		$name .':'. $port .' on '. $hostname .';'.
+		$name .':'. $port . $path .' on '. $hostname .';'.
 		$code .';'. $response ."\n";
 	close CMD_FILE;
 }
