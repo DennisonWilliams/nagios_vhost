@@ -424,7 +424,7 @@ sub initDB{
 	if (defined($DBI::errstr) && $DBI::errstr =~ /no such table/) {
 		install();
 		$sth = $DBH->prepare("INSERT INTO variables(`key`, `value`) values(?, ?)");
-		$sth->execute('schema_version', 3);
+		$sth->execute('schema_version', 5);
 	} else {
 	
 		$sth->execute();
@@ -435,7 +435,7 @@ sub initDB{
 		if (!defined($schema_version)) {
 				install();
 				$sth = $DBH->prepare("INSERT INTO variables(`key`, `value`) values(?, ?)");
-				$sth->execute('schema_version', 3);
+				$sth->execute('schema_version', 5);
 		}
 	}
 
@@ -502,6 +502,15 @@ sub initDB{
 		$schema_version = 4;
 	}
 
+	if ($schema_version == 4) {
+		$sth = $DBH->prepare("ALTER TABLE vhost_alias add response INT");
+		$sth->execute();
+		$sth = $DBH->prepare("ALTER TABLE vhost_alias add column query_string VARCHAR(255)");
+		$sth->execute();
+		$st_schema->execute('5', 'schema_version');		
+		$schema_version = 5;
+	}
+
 }
 
 sub install {
@@ -554,6 +563,8 @@ sub install {
 			vhost_id INTEGER,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255),
+			response INT NOT NULL DEFAULT 200,
+			query_string VARCHAR(255),
 			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
 	)");
 	$sth->execute();
@@ -1068,7 +1079,7 @@ sub process_server_vhosts {
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
-		"SELECT name FROM vhost_alias WHERE vhost_id = ?")
+		"SELECT name,query_string,response FROM vhost_alias WHERE vhost_id = ?")
 		|| die "$DBI::errstr";
 
 	while (1) {
@@ -1138,8 +1149,10 @@ sub process_server_vhosts {
 						exit 0;
 					}
 				} else {
+					my $query_string = $vhost_alias->{query_string} ? $vhost_alias->{query_string} : $vhost->{query_string};
+					my $response = $vhost_alias->{response} ? $vhost_alias->{response} : $vhost->{response};
 					check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
-						$vhost->{query_string}, $hostname, $vhost->{response});
+						$query_string, $response);
 				}
 			} # Loop all vhoost aliases
 		} # Loop all vhosts
