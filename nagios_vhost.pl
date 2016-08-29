@@ -339,7 +339,7 @@ package main;
 our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
-our ($UPDATEWEBSERVERS, $LOCATION);
+our ($UPDATEWEBSERVERS, $LOCATION, $DBNAME, $DBUSER, $DBPASS);
 
 # The max amount of time that can pass between checking vhosts in seconds
 $MAXTURNAROUNDTIME = 10*60;
@@ -350,6 +350,9 @@ $MAXTHREADSPERHOST = 5;
 
 $VERBOSE = 0;
 $DBFILE = dirname(abs_path($0)) .'/.'. basename($0) .'.db';
+$DBNAME = 'nagios_vhost';
+$DBUSER = 'nagios_vhost';
+$DBPASS = 'nagios_vhost';
 $NAGIOSCONFIGDIR = '/etc/nagios3/conf.d/';
 $USENSCA = 0;
 $CMD_FILE = '/var/lib/nagios3/rw/nagios.cmd';
@@ -408,13 +411,14 @@ sub initDB{
 		if $VERBOSE;	
 	# Connect to the database
 	# TODO: add RaiseError
-	$DBH = DBI->connect("dbi:SQLite:dbname=$DBFILE", "", "",{ 
+	$DBH = DBI->connect("dbi:mysql:database=$DBNAME:host=127.0.0.1", 
+		$DBUSER, $DBPASS,{ 
 		RaiseError => 1,
 		sqlite_use_immediate_transaction => 1 })
 			|| die "Could not connect to database: $DBI::errstr";
 
 	# This needs to get done so that sqlite3 honors the FK constraints
-	$DBH->do("PRAGMA foreign_keys = ON");
+	#$DBH->do("PRAGMA foreign_keys = ON");
 
 	# TODO: this will generate a error if the schema has not been installed yet,
 	# but will not fail.
@@ -424,7 +428,7 @@ sub initDB{
 	if (defined($DBI::errstr) && $DBI::errstr =~ /no such table/) {
 		install();
 		$sth = $DBH->prepare("INSERT INTO variables(`key`, `value`) values(?, ?)");
-		$sth->execute('schema_version', 3);
+		$sth->execute('schema_version', 5);
 	} else {
 	
 		$sth->execute();
@@ -502,6 +506,25 @@ sub initDB{
 		$schema_version = 4;
 	}
 
+	# Addition of the vhost_problems table
+	if ($schema_version == 4) {
+		$sth = $DBH->prepare(
+			"CREATE TABLE vhost_problems (
+				host_id INTEGER,
+				vhost_id INTEGER PRIMARY KEY,
+				name VARCHAR(255),
+				ip VARCHAR(15),
+				port INT NOT NULL DEFAULT 80,
+				response INT NOT NULL DEFAULT 200,
+				query_string VARCHAR(255),
+				FOREIGN KEY(host_id) REFERENCES host(host_id) ON DELETE CASCADE
+		)");
+		$sth->execute;
+
+		$st_schema->execute('5', 'schema_version');		
+		$schema_version = 5;
+	}
+
 }
 
 sub install {
@@ -558,6 +581,21 @@ sub install {
 	)");
 	$sth->execute();
 	$sth->finish();
+
+	$sth = $DBH->prepare(
+		"CREATE TABLE vhost_problems (
+			host_id INTEGER,
+			vhost_id INTEGER PRIMARY KEY,
+			name VARCHAR(255),
+			ip VARCHAR(15),
+			port INT NOT NULL DEFAULT 80,
+			response INT NOT NULL DEFAULT 200,
+			query_string VARCHAR(255),
+			FOREIGN KEY(host_id) REFERENCES host(host_id) ON DELETE CASCADE
+	)");
+	$sth->execute();
+	$sth->finish();
+
 }
 
 sub add_new_web_server_to_db{
@@ -965,7 +1003,7 @@ sub run_checks_as_daemon {
 	# process only the one you send the signal to
 	$SIG{USR1} = sub { print_statistics(); };
 
-	Proc::Daemon::Init;
+	#Proc::Daemon::Init;
 	initDB();
 	$LOGGER->debug('Application daemonized');
 
@@ -982,11 +1020,12 @@ sub run_checks_as_daemon {
 		die $@;
 	}
 
+	# Fork off timed loop for processing each servers vhosts
 	while (my $host = $sth->fetchrow_hashref()) {
-		if ($host->{name} =~ '/blog-psaonl/') {
-			next;
-		}
+		# TODO: remove this debug before pushing
+		next unless ($host->{name} =~ /^charlotte/);
 		$LOGGER->debug($host->{name});
+
 		my $pid = fork();
 		if ($pid) {
 			push @servers, $pid;
@@ -996,7 +1035,19 @@ sub run_checks_as_daemon {
 			process_server_vhosts($host->{host_id}, $host->{name});
 			exit 0;
 		}
+
+		$pid = fork();
+		if ($pid) {
+			push @servers, $pid;
+			$LOGGER->debug('New process ('. $pid .') started to handle '. 
+				$host->{name} .' vhost problems');
+		} else {
+			$0 = $0 ." [". $host->{name} ." problems thread]";
+			process_server_vhost_problems($host->{host_id}, $host->{name});
+			exit 0;
+		}
 	}
+
 
 	# Don't abandon your children
 	my $kid;
@@ -1019,7 +1070,7 @@ sub response_redirect {
 		# This is an ugly fix, but to help keep us from ending up in the 
 		# redirection loop then we need to check against a possible 
 		# redirection location set in the check_host method.
-		if ($response->header('Location') eq $LOCATION) {
+		if ($LOCATION && $response->header('Location') eq $LOCATION) {
 			$LOCATION = 'matched';
 			return;
 		}
@@ -1038,7 +1089,7 @@ sub response_redirect {
 			$response->header('Location') =~ /(http[^:]*):\/\/([^\/]+)(\/.*)?/;
 			$LOGGER->debug("response_redirect() HOST header: $2");
 			$ua->add_header(HOST => $2);
-			$url = $1 .'://'. $ip . $3;
+			$url = $1 .'://'. $ip . ($3?$3:'');
 		}
 
 		$LOGGER->debug("response_redirect() new url: $url");
@@ -1071,7 +1122,7 @@ sub process_server_vhosts {
 		|| die "$DBI::errstr";
 
 	my $stva = $DBH->prepare(
-		"SELECT name FROM vhost_alias WHERE vhost_id = ?")
+		"SELECT name,response,query_string FROM vhost_alias WHERE vhost_id = ?")
 		|| die "$DBI::errstr";
 
 	while (1) {
@@ -1083,6 +1134,8 @@ sub process_server_vhosts {
 		while (my $vhost = $stv->fetchrow_hashref()) {
 			$LOGGER->debug('process_server_vhosts(): Processing vhost '. $vhost->{name} .' for '. $hostname);
 			$num_vhosts++;
+			$vhost->{hostname} = $hostname;
+			$vhost->{host_id} = $host_id;
 			if ($sleep) {
 				$LOGGER->debug("Sleeping for $sleep ms");
 				usleep($sleep);
@@ -1104,19 +1157,24 @@ sub process_server_vhosts {
 					$LOGGER->debug('Forked a new process ('. $pid .')');
 					$children{$pid} = 1;
 				} else {
-					check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, 
-						$vhost->{query_string}, $hostname, $vhost->{response});
+					check_host($vhost);
 					exit 0;
 				}
 			} else {
-				check_host($vhost->{name}, $vhost->{ip}, $vhost->{port}, 
-					$vhost->{query_string}, $hostname, $vhost->{response});
+				check_host($vhost);
 			}
 
 			$stva->execute($vhost->{vhost_id});
 			while (my $vhost_alias = $stva->fetchrow_hashref()) {
-				$LOGGER->debug('process_server_vhosts(): Processing vhost alias '. $vhost_alias->{name} .' for '. $hostname);
 				$num_vhosts++;
+				$vhost->{name} = $vhost_alias->{name}
+					if $vhost_alias->{name};
+				$vhost->{query_string} = $vhost_alias->{query_string}
+					if $vhost_alias->{query_string};
+				$vhost->{response} = $vhost_alias->{response}
+					if $vhost_alias->{response};
+				$LOGGER->debug('process_server_vhosts(): Processing vhost alias '. $vhost_alias->{name} .' for '. $hostname);
+				$LOGGER->debug(Dumper($vhost));
 				if ($sleep) {
 					usleep($sleep);
 				} 
@@ -1136,13 +1194,11 @@ sub process_server_vhosts {
 						$LOGGER->debug('Forked a new process ('. $pid .')');
 						$children{$pid} = 1;
 					} else {
-						check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
-							$vhost->{query_string}, $hostname, $vhost->{response});
+						check_host($vhost);
 						exit 0;
 					}
 				} else {
-					check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
-						$vhost->{query_string}, $hostname, $vhost->{response});
+					check_host($vhost);
 				}
 			} # Loop all vhoost aliases
 		} # Loop all vhosts
@@ -1195,12 +1251,46 @@ sub process_server_vhosts {
 	
 }
 
+# This method is very similar to process_server_vhosts() except that there
+# is no timing constraints and it only processes vhosts that are added to
+# a problem queue.  Ie the vhost_problems table
+# It is intended to be forked off for each host
+sub process_server_vhost_problems {
+	my ($host_id, $hostname) = @_;
+	# TODO:
+	# $SIG{USR1} = sub { print_problem_statistics($host_id, $total_time, $sleep, $threads); };
+	$LOGGER->debug('process_server_vhost_problems('. $host_id .', '. $hostname .')');
+
+  my$query ="SELECT host_id, vhost_id, name, ip, port, response, query_string ".
+		" FROM vhost_problems WHERE host_id = ?";
+	my $stvp = $DBH->prepare($query)
+		|| die "$DBI::errstr";
+
+	while (1) {
+		$LOGGER->error("Unable to execute: $query : ". $stvp->errstr)
+			unless $stvp->execute($host_id);
+		while (my $vhost = $stvp->fetchrow_hashref()) {
+			$vhost->{hostname} = $hostname;
+			$vhost->{host_id} = $host_id;
+
+			$LOGGER->debug('process_server_vhost_problems(): Processing vhost '. 
+				$vhost->{name} .' for '. $hostname);
+
+			check_host($vhost);
+			sleep 1;
+		}
+		$stvp->finish();
+	}
+}
+
 sub check_host {
-	my ($name, $ip, $port, $query_string, $hostname, $rc) = @_;
-	$LOGGER->debug("check_host($name, $ip, $port, \$query_string, $hostname, $rc)");
+	my ($vhost) = @_;
+	$LOGGER->debug("check_host(". $vhost->{name} .', '. $vhost->{ip}
+		.', '. $vhost->{port} .', $query_string, '. $vhost->{hostname}
+		.', '. $vhost->{response} .')');
 	my $code = 0;
 	my $http = 'http';
-	if ($port == 443) {
+	if ($vhost->{port} == 443) {
 		$http .= 's';
 	}
 
@@ -1213,66 +1303,106 @@ sub check_host {
 	$mech->conn_cache(LWP::ConnCache->new);
 	$LOGGER->debug('Mechanize browser initialized');
 
-	$hostname =~ /^([^\.]+)/;
+	$vhost->{hostname} =~ /^([^\.]+)/;
 	my $short_hostname = $1;
 
-	$mech->add_header(HOST => $name);
+	$mech->add_header(HOST => $vhost->{name});
 
 	# This is a hack for passing data back and forth betwee the redirection
 	# handler, as we want to exit the handler as soon as there is a match of
 	# the redirection;
-	if ($query_string && $rc =~ /3\d\d/) {
-		$LOCATION = $query_string;
+	if ($vhost->{query_string} && $vhost->{response} =~ /3\d\d/) {
+		$LOCATION = $vhost->{query_string};
 	} else {
-		$LOCATION = $query_string;
+		$LOCATION = $vhost->{query_string};
 	}
 	eval {
-		$mech->get($http ."://$ip");
+		$mech->get($http ."://". $vhost->{ip});
 	};
 	if ($@) {
-		$LOGGER->error("Issues: $@. vhost=$name");
+		$LOGGER->error("Issues: $@. vhost=". $vhost->{name});
+		$LOGGER->debug("vhost=". Dumper($vhost));
 	}
 
-	my $response = "$http://$name returned: ";
+	my $response = "$http://". $vhost->{name} ." returned: ";
 
 	# TODO: is this a problem with the special characters in a url?
-	if ($LOCATION ne 'matched' && $rc =~ /3\d\d/ ) {
-		$response .= " Did NOT $rc to expected location: $query_string";
+	if ($LOCATION && $LOCATION ne 'matched' && $vhost->{response} =~ /3\d\d/ ) {
+		$response .= " Did NOT ". $vhost->{response} ." to expected location: ".
+			$vhost->{query_string};
 		$code=2;
-	} elsif ($LOCATION eq 'matched' && $rc =~ /3\d\d/) {
-		$response .= " $rc to expected location: $query_string";
-	} elsif($rc != '200' && $rc == $mech->response()->code()) {
-		$response .= " expected $rc";
+	} elsif ($LOCATION && $LOCATION eq 'matched' && $vhost->{response} =~ /3\d\d/) {
+		$response .= ' '. $vhost->{response} .' to expected location: '.
+			$vhost->{query_string};
+	} elsif($vhost->{response} != '200' && 
+		$vhost->{response} == $mech->response()->code()) {
+		$response .= ' expected '. $vhost->{response};
 	} else {
 		$response .= $mech->response()->code() .'.';
-		if ($mech->response()->code() != $rc) {
+		if ($mech->response()->code() != $vhost->{response}) {
 			$code=2;
 		} else {
 			if (
-				$query_string &&
-				($mech->content() !~ /$query_string/) &&
-				($mech->content(format => 'text') !~ /$query_string/) ){
-				$response .= ' Response did not match "'. $query_string .'".';
+				$vhost->{query_string} &&
+				($mech->content() !~ /$vhost->{query_string}/) &&
+				($mech->content(format => 'text') !~ /$vhost->{query_string}/) ){
+				$response .= ' Response did not match "'. $vhost->{query_string} .'".';
 				$code = 3;
 			} #if
 			else {
-				$response .= ' Response matched "'. $query_string .'".';
+				$response .= ' Response matched "'. 
+					($vhost->{query_string}?$vhost->{query_string}:'') .'".';
 			} #else
 		}	#else
 	} #else
 
-	$LOGGER->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'. 
-		$name .':'. $port .' on '. $hostname .';'. 
-		$code .';'. $response);
+	# Manage the problems queue
+	# http://nagios.sourceforge.net/docs/3_0/pluginapi.html
+	# TODO: make sure that adding or deleting silently fails if the vhost
+	# already exists or does not exist
+	if ($code) {
+		# Add the host to the queue
+		my $stvpi = $DBH->prepare(
+			"INSERT INTO vhost_problems(host_id, vhost_id, name, ip, port, ".
+			"response, query_string) ".
+			"VALUES(?, ?, ?, ?, ?, ?, ?)"
+		);
+		eval {
+			$LOGGER->debug('Adding '. $vhost->{name} .' to problem queue: '.
+				$vhost->{host_id} .', '. $vhost->{vhost_id} .', '. 
+				$vhost->{name} .', '. $vhost->{ip} .', '. $vhost->{port}  .', '.
+				$vhost->{response} .', '. $vhost->{query_string});
+			$stvpi->execute($vhost->{host_id}, $vhost->{vhost_id}, 
+				$vhost->{name}, $vhost->{ip}, $vhost->{port}, 
+				$vhost->{response}, $vhost->{query_string});
+		};
+		if ($@) {
+			$LOGGER->error($@);
+		}
+	} else {
+		# Remove the host fromthe queue
+		my $stvpd = $DBH->prepare(
+			"DELETE FROM vhost_problems ".
+			"WHERE host_id=? AND vhost_id=?"
+		);
+		$stvpd->execute($vhost->{host_id}, $vhost->{vhost_id});
+	}
+
+	$LOGGER->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. 
+		$short_hostname .';'. 
+		$vhost->{name} .':'. $vhost->{port} .' on '. $vhost->{hostname} .';'. 
+		($vhost->{code}?$vhost->{code}:'200') .';'. ($response?$response:'') );
 
 	if (! open(CMD_FILE, '>>', $CMD_FILE)) {
 		$LOGGER->fatal("Could not open $CMD_FILE to append data to: $!");
 		die;
 	}
 	print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
-		$name .':'. $port .' on '. $hostname .';'.
-		$code .';'. $response ."\n";
+		$vhost->{name} .':'. $vhost->{port} .' on '. $vhost->{hostname} .';'.
+		($vhost->{code}?$vhost->{code}:'200') .';'. ($response?$response:'') ."\n";
 	close CMD_FILE;
+
+	# TODO: Manage the vhost_problem table
 }
 
 # When this is trigered from process_server_vhosts it will cause the loop to 
@@ -1291,6 +1421,7 @@ sub print_statistics {
 		"WHERE vhost.host_id = ? ".
 		"GROUP BY vhost.vhost_id");
 
+	my $sth_vhost_problems;
 	my $sth_hosts;
 	if (defined ($host_id)) {
 		$sth_hosts = $DBH->prepare(
@@ -1299,6 +1430,14 @@ sub print_statistics {
 			"WHERE host.host_id = ? ".
 			"GROUP BY host.host_id");
 		$sth_hosts->execute($host_id);
+
+		$sth_vhost_problems = $DBH->prepare(
+			"SELECT count(name) as vhost_problems ".
+			"FROM vhost_problems ".
+			"WHERE vhost_problems.host_id = ?"
+		);
+		$sth_vhost_problems->execute($host_id);
+
 		
 	} else {
 		$sth_hosts = $DBH->prepare(
@@ -1321,9 +1460,10 @@ sub print_statistics {
 			$host->{vhosts} .' vhosts, '. $vhost_aliases ." aliases)");
 
 		if ($host_id) {
+			my $problems = $sth_vhost_problems->fetchrow_hashref();
 			$LOGGER->info($host->{name} .' has a RTT of '. $time .' seconds is using '.
-				'a sleep of '. $sleep .' micro seconds, and is utilizing '. $threads 
-				.' threads');
+				'a sleep of '. $sleep .' micro seconds, is utilizing '. $threads 
+				.' threads, and has '. $problems->{vhost_problems} .' problems.');
 		}
 	}
 	
