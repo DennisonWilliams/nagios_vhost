@@ -1561,11 +1561,10 @@ sub print_statistics {
 	$LOGGER->level($level);
 }
 
+# get all hosts associated with Drupal, log in and check for module updates
 sub get_and_send_web_application_status_to_nagios {
-	# get all hosts associated with Drupal, log in and check for module updates
 
-	# TODO: should we poll the system to find the user that apache is running as?
-	my $check_drupal_cmd = "/usr/bin/check_drupal.pl ups ";
+	my $check_drupal_cmd = "/usr/bin/check_drupal.pl -p ";
 	
 	my $sth = $DBH->prepare(
 	'SELECT host.name as hostname, host.nagios_host_name as nagios_hostname,
@@ -1580,8 +1579,11 @@ sub get_and_send_web_application_status_to_nagios {
 	$sth->execute('Drupal');
 	while (my $result = $sth->fetchrow_hashref()) {
 		my $vhosts = sshopen2($result->{hostname}, *READER5, *WRITER5, 
-			$check_drupal_cmd .'-p '. $result->{path});
+			$check_drupal_cmd . $result->{path} ." --uri=". $result->{vhostname});
+			#$check_drupal_cmd . $result->{path} ." --verbose");
 		while (my $line = <READER5>) {
+			#print $line if $VERBOSE;
+			#print $check_drupal_cmd . $result->{path} ."\n" if $VERBOSE;
 			print $result->{vhostname} .": $line" if $VERBOSE;
 		}
 	}
