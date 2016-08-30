@@ -909,18 +909,18 @@ sub collect_vhosts_from_webservers {
 
 sub check_vhost_application_type {
 	my ($host, $path) = @_;
-	print "check_vhost_application_type($host, $path)\n" if $VERBOSE;
+	print "check_vhost_application_type($host, $path)\n" if $VERBOSE>1;
 
 	my $test_for_drupal_command = "grep Drupal $path/CHANGELOG.txt 2>/dev/null|wc -l 2>/dev/null";
 	my $test_for_wordpress_command = "grep WordPress $path/license.txt 2>/dev/null|wc -l 2>/dev/null";
 
-	print "Running `$test_for_drupal_command`\n" if $VERBOSE;	
+	print "\tRunning `$test_for_drupal_command`\n" if $VERBOSE >1;	
 	sshopen2($host, *READER3, *WRITER3, $test_for_drupal_command);
   my $line;
 	$line = <READER3>;
   return 'Drupal' if $line > 0;
 
-	print "Running `$test_for_wordpress_command`\n" if $VERBOSE;	
+	print "\tRunning `$test_for_wordpress_command`\n" if $VERBOSE >1;	
 	sshopen2($host, *READER4, *WRITER4, $test_for_wordpress_command);
 	$line = <READER4>;
   return 'WordPress' if $line > 0;
@@ -1008,6 +1008,10 @@ sub generate_nagios_config_files {
 		"SELECT name,path FROM vhost_url WHERE vhost_id = ?")
 		|| die "$DBI::errstr";
 
+	my $stvas = $DBH->prepare(
+		"SELECT type,path FROM vhost_application WHERE vhost_id = ?")
+		|| die "$DBI::errstr";
+
 	# Create a new config file for each host
 	# The format of the config file is our modified version of the check_vhosts
 	# script: http://exchange.nagios.org/directory/Plugins/Web-Servers/check_vhosts/details
@@ -1041,7 +1045,7 @@ sub generate_nagios_config_files {
 		open (HOSTFILE, '+>', $NAGIOSCONFIGDIR . $host->{name} .'_vhosts.cfg')
 			|| die('Could not open the vhost config file ('. $NAGIOSCONFIGDIR . $host->{name} .'_vhosts.cfg' .'): '. $?);
 		$stv->execute($host->{host_id});
-		my $cluster;
+		my ($cluster, $wp_cluster, $drupal_cluster);
 		while (my $vhost = $stv->fetchrow_hashref()) {
 			print HOSTFILE "define service {\n".
 				"\tuse generic-service-passive-no-notification-no-perfdata\n".
@@ -1101,6 +1105,38 @@ sub generate_nagios_config_files {
 					"\texecution_failure_criteria n\n".
 					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
 			}
+
+			# Create Nagios config entries for the web applications
+			$stvas->execute($vhost->{vhost_id});
+			while (my $vhostapp = $stvas->fetchrow_hashref()) {
+				print HOSTFILE "define service {\n".
+					"\tuse generic-service-passive-no-notification-onceaday\n".
+					"\tservice_description ". $vhost->{name} .':'. $vhost->{port} .' on '. 
+						$host->{name} ." ". $vhostapp->{type} ." Updates\n".
+					"\tservicegroups ". $host->{name} ."_". lc($vhostapp->{type}) ."_updates\n".
+					"\thost_name $short_hostname\n}\n\n";
+
+				if ($vhostapp->{type} =~ /Drupal/) {
+					$drupal_cluster .= ',' if $drupal_cluster;
+					$drupal_cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
+						$vhost->{name} .':'. $vhost->{port} .' on '. 
+							$host->{name} ." Drupal Updates\$";
+				} elsif ($vhostapp->{type} =~ /WordPress/) {
+          $wp_cluster .= ',' if $wp_cluster;
+          $wp_cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
+            $vhost->{name} .':'. $vhost->{port} .' on '. 
+              $host->{name} ." WordPress Updates\$";
+        }
+
+				print HOSTFILE "define servicedependency {\n".
+					"\thost_name $short_hostname\n".
+					"\tservice_description ". $vhostapp->{type} ." Updates\n".
+					"\tdependent_host_name $short_hostname\n".
+					"\tdependent_service_description ". $vhost->{name} .':'. $vhost->{port} .
+						' on '. $host->{name} ." ". $vhostapp->{type} ." Updates\n".
+					"\texecution_failure_criteria n\n".
+					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
+			}
 		}
 
 #		print HOSTFILE "define servicedependency {\n".
@@ -1117,6 +1153,10 @@ sub generate_nagios_config_files {
 			"\tservicegroup_name ". $host->{name} ."_aliases\n}\n\n";
 		print HOSTFILE "define servicegroup {\n".
 			"\tservicegroup_name ". $host->{name} ."_urls\n}\n\n";
+		print HOSTFILE "define servicegroup {\n".
+			"\tservicegroup_name ". $host->{name} ."_drupal_updates\n}\n\n";
+		print HOSTFILE "define servicegroup {\n".
+			"\tservicegroup_name ". $host->{name} ."_wordpress_updates\n}\n\n";
 
 		$cluster =~ s/,$//;
 		print HOSTFILE "define service{\n".
@@ -1124,6 +1164,18 @@ sub generate_nagios_config_files {
 			"\tservice_description HTTP Vhosts\n".
 			"\thost_name $short_hostname\n".
 			"\tcheck_command check_service_cluster!\"HTTP Vhosts\"!0!1!$cluster\n}\n\n";
+
+		print HOSTFILE "define service{\n".
+			"\tuse generic-service\n".
+			"\tservice_description Drupal Updates\n".
+			"\thost_name $short_hostname\n".
+			"\tcheck_command check_service_cluster!\"Drupal Updates\"!0!1!$drupal_cluster\n}\n\n";
+
+		print HOSTFILE "define service{\n".
+			"\tuse generic-service\n".
+			"\tservice_description WordPress Updates\n".
+			"\thost_name $short_hostname\n".
+			"\tcheck_command check_service_cluster!\"Wordpress Updates\"!0!1!$wp_cluster\n}\n\n";
 
 		close HOSTFILE;
 	}
@@ -1576,8 +1628,8 @@ sub get_and_send_web_application_status_to_nagios {
 	
 	my $sth = $DBH->prepare(
 	'SELECT host.name as hostname, host.nagios_host_name as nagios_hostname,
-		vhost.name as vhostname, 
-		vhost_application.path as path
+		vhost.name as vhostname, vhost.port as port,
+		vhost_application.path as path, vhost_application.type as type
 		FROM host
 		LEFT JOIN vhost ON (host.host_id = vhost.host_id)
 		LEFT JOIN vhost_application ON ( vhost.vhost_id = vhost_application.vhost_id)
@@ -1600,7 +1652,9 @@ sub get_and_send_web_application_status_to_nagios {
 			$rc = 2 if $line =~ /CRITICAL/;
 			$rc = 3 if $line =~ /UNKNOWN/;
 
-			print NSCA $result->{nagios_hostname} ."\t". $result->{vhostname} ." Drupal Updates\t$rc\t$line";
+			print NSCA $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
+				$result->{port} .' on '. $result->{hostname} ." ". $result->{type} .
+				" Updates\t$rc\t$line";
 
 			close NSCA;
 		}
@@ -1621,7 +1675,10 @@ sub get_and_send_web_application_status_to_nagios {
 			my $rc = 0;
 			$rc = 2 if $line =~ /CRITICAL/;
 
-			print NSCA $result->{nagios_hostname} ."\t". $result->{vhostname} ." WordPress Updates\t$rc\t$line";
+			print NSCA $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
+				$result->{port} .' on '. $result->{hostname} ." ". $result->{type} .
+				" Updates\t$rc\t$line";
+
 
 			close NSCA;
 		}
