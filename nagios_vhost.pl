@@ -344,6 +344,11 @@ our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
 our ($UPDATEWEBSERVERS, $LOCATION, $WEBAPPLICATIONSTATUSTONAGIOS);
 
+# The following globals are used to send web application update status to nsca
+our ($NSCA, $NSCA_HOST, $NSCA_CONFIG);
+$NSCA="/usr/sbin/send_nsca";
+$NSCA_HOST = 'localhost';
+$NSCA_CONFIG = '/etc/send_nsca.cfg';
 
 # The max amount of time that can pass between checking vhosts in seconds
 $MAXTURNAROUNDTIME = 10*60;
@@ -370,6 +375,8 @@ my $result = GetOptions (
 	"daemon"    => \$DAEMON,
 	"use-nsca"    => \$USENSCA,
 	"external-command-file:s"    => \$CMD_FILE,
+	"nsca-host:s"    => \$NSCA_HOST,
+	"nsca-config:s"    => \$NSCA_CONFIG,
 	"verbose+"    => \$VERBOSE,
 	"help" => \$help
 );
@@ -1565,6 +1572,7 @@ sub print_statistics {
 sub get_and_send_web_application_status_to_nagios {
 
 	my $check_drupal_cmd = "/usr/bin/check_drupal.pl -p ";
+	my $check_wordpress_cmd = "/usr/bin/check_wordpress -p ";
 	
 	my $sth = $DBH->prepare(
 	'SELECT host.name as hostname, host.nagios_host_name as nagios_hostname,
@@ -1582,11 +1590,44 @@ sub get_and_send_web_application_status_to_nagios {
 			$check_drupal_cmd . $result->{path} ." --uri=". $result->{vhostname});
 			#$check_drupal_cmd . $result->{path} ." --verbose");
 		while (my $line = <READER5>) {
-			#print $line if $VERBOSE;
-			#print $check_drupal_cmd . $result->{path} ."\n" if $VERBOSE;
-			print $result->{vhostname} .": $line" if $VERBOSE;
+			# RETURN CODES:
+			# 0-OK, 1-WARNING, 2-CRITICAL, 3-UNKNOWN
+			open(NSCA, "|$NSCA -H $NSCA_HOST -c $NSCA_CONFIG") or 
+				die "could not start nsca: $NSCA -H $NSCA_HOST -c $NSCA_CONFIG";
+
+			my $rc = 0;
+			$rc = 1 if $line =~ /WARNING/;
+			$rc = 2 if $line =~ /CRITICAL/;
+			$rc = 3 if $line =~ /UNKNOWN/;
+
+			print NSCA $result->{nagios_hostname} ."\t". $result->{vhostname} ." Drupal Updates\t$rc\t$line";
+
+			close NSCA;
 		}
 	}
+	close READER5;
+	close WRITER5;
+
+	$sth->execute('WordPress');
+	while (my $result = $sth->fetchrow_hashref()) {
+		sshopen2($result->{hostname}, *READER6, *WRITER6, $check_wordpress_cmd .$result->{path});
+		while (my $line = <READER6>) {
+
+			# RETURN CODES:
+			# 0-OK, 1-WARNING, 2-CRITICAL, 3-UNKNOWN
+			open(NSCA, "|$NSCA -H $NSCA_HOST -c $NSCA_CONFIG") or 
+				die "could not start nsca: $NSCA -H $NSCA_HOST -c $NSCA_CONFIG";
+
+			my $rc = 0;
+			$rc = 2 if $line =~ /CRITICAL/;
+
+			print NSCA $result->{nagios_hostname} ."\t". $result->{vhostname} ." WordPress Updates\t$rc\t$line";
+
+			close NSCA;
+		}
+	}
+	close READER6;
+	close WRITER6;
 }
 
 sub usage {
