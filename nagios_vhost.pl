@@ -342,7 +342,8 @@ package main;
 our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
-our ($UPDATEWEBSERVERS, $LOCATION);
+our ($UPDATEWEBSERVERS, $LOCATION, $WEBAPPLICATIONSTATUSTONAGIOS);
+
 
 # The max amount of time that can pass between checking vhosts in seconds
 $MAXTURNAROUNDTIME = 10*60;
@@ -365,6 +366,7 @@ my $result = GetOptions (
 	"add-vhost-query-string:s" => \$ADDVHOSTQUERYSTRING,
 	"nagios-config-dir:s" => \$NAGIOSCONFIGDIR,
 	"update-web-servers:s" => \$UPDATEWEBSERVERS,
+	"web-application-status-to-nagios" => \$WEBAPPLICATIONSTATUSTONAGIOS,
 	"daemon"    => \$DAEMON,
 	"use-nsca"    => \$USENSCA,
 	"external-command-file:s"    => \$CMD_FILE,
@@ -394,6 +396,8 @@ if ($ADDWEBSERVER) {
 } elsif (defined($UPDATEWEBSERVERS)) {
 	collect_vhosts_from_webservers($UPDATEWEBSERVERS);
 	generate_nagios_config_files($UPDATEWEBSERVERS);
+} elsif (defined $WEBAPPLICATIONSTATUSTONAGIOS) {
+	get_and_send_web_application_status_to_nagios();
 } else {
 	usage();
 }
@@ -529,6 +533,18 @@ sub initDB{
 		$schema_version = 6;
 	}
 
+	if ($schema_version == 6) {
+		$sth = $DBH->prepare(
+			"CREATE TABLE vhost_application (
+				vhost_id INTEGER,
+				type VARCHAR(255),
+				path VARCHAR(255),
+				FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
+		)");
+		$sth->execute();
+		$st_schema->execute('7', 'schema_version');		
+		$schema_version = 7;
+	}
 }
 
 sub install {
@@ -595,6 +611,16 @@ sub install {
 			path VARCHAR(255),
 			response INT NOT NULL DEFAULT 200,
 			query_string VARCHAR(255),
+			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
+	)");
+	$sth->execute();
+	$sth->finish();
+
+	$sth = $DBH->prepare(
+		"CREATE TABLE vhost_application (
+			vhost_id INTEGER,
+			type VARCHAR(255),
+			path VARCHAR(255),
 			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
 	)");
 	$sth->execute();
@@ -671,6 +697,11 @@ sub collect_vhosts_from_webservers {
 		|| die "$DBI::errstr";;
 	my $stvui = $DBH->prepare('INSERT INTO vhost_url(vhost_id, name, path, response, query_string) values(?, ?, ?, ?, ?)')
 		|| die "$DBI::errstr";;
+	my $stvapd = $DBH->prepare('DELETE from vhost_application where vhost_id=?')
+		|| die "$DBI::errstr";;
+	my $stvapi = $DBH->prepare('INSERT INTO vhost_application(vhost_id, type, path) values(?, ?, ?)')
+		|| die "$DBI::errstr";;
+
 
 	my $get_vhosts_cmd = "PATH=\$PATH:/usr/sbin; sudo apachectl -t -D DUMP_VHOSTS";
 	my $get_config_file_cmd = "/bin/cat ";
@@ -747,7 +778,9 @@ sub collect_vhosts_from_webservers {
 				my @server_comments = $acp->find_siblings_directive_names($sn, 'comment');
 				my @server_aliases = $acp->find_siblings_directive_names($sn, 'serveralias');
 				my @virtual_hosts = $acp->find_siblings_and_up_directive_names($sn, 'virtualhost');
+				my @document_roots = $acp->find_siblings_and_up_directive_names($sn, 'documentroot');
 				my $server_name  = $sn->value;
+				my $document_root = $document_roots[0]->value;
 				my $virtual_host = $virtual_hosts[0]->value;
 
 				next if ($server_name ne $vhost);
@@ -757,6 +790,11 @@ sub collect_vhosts_from_webservers {
 				if ($vhost_ip && ($vhost_ip ne '*') && ($vhost_ip !~ /\s/)) {
 					$vhosts{$vhost}{$port}{ip} = $vhost_ip;
 				}
+
+				# Record where the documentroot is
+				$vhosts{$vhost}{$port}{documentroot} = $document_root;
+				# Log back into the server and attempt to determine the application type
+				$vhosts{$vhost}{$port}{application} = check_vhost_application_type($host->{name}, $vhosts{$vhost}{$port}{documentroot});
 
 				foreach my $sa (@server_aliases) {
 					my $sav = $sa->value;
@@ -807,6 +845,15 @@ sub collect_vhosts_from_webservers {
 				$stvai->execute($vhost->{vhost_id}, $_);
 			}
 
+			# We just remove the application types we found and then re-add them
+			print "\tRemoving vhost_application rows for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
+			$stvapd->execute($vhost->{vhost_id});
+
+			print "\tInserting ". $vhosts{$vhost->{name}}{$vhost->{port}}{application} ." as application for ". $vhost->{name} .":". $vhost->{port} ."...\n" 
+				if $VERBOSE && $vhosts{$vhost->{name}}{$vhost->{port}}{application};	
+			$stvapi->execute($vhost->{vhost_id}, $vhosts{$vhost->{name}}{$vhost->{port}}{application}, $vhosts{$vhost->{name}}{$vhost->{port}}{documentroot})
+				if $vhosts{$vhost->{name}}{$vhost->{port}}{application};	
+
 			# TODO: if the url is actually a vhost or vhost_alias, update that instead of 
 			# adding a row in the urls table
 			# We just remove the urls and add the ones we found
@@ -839,11 +886,37 @@ sub collect_vhosts_from_webservers {
 					print "Adding $_ as alias for $vhost:$port...\n" if $VERBOSE;
 					$stvai->execute($rowid, $_);
 				}
+				
+				print "\tInserting ". $vhosts{$vhost}{$port}{application} ." as application for ". $vhost .":". $port ."...\n" 
+					if $VERBOSE && $vhosts{$vhost}{$port}{application};	
+				$stvapi->execute($rowid, $vhosts{$vhost}{$port}{application}, $vhosts{$vhost}{$port}{documentroot})
+					if $vhosts{$vhost}{$port}{application};	
+
 			}
 		}
 
+
 	}
 	
+}
+
+sub check_vhost_application_type {
+	my ($host, $path) = @_;
+	print "check_vhost_application_type($host, $path)\n" if $VERBOSE;
+
+	my $test_for_drupal_command = "grep Drupal $path/CHANGELOG.txt 2>/dev/null|wc -l 2>/dev/null";
+	my $test_for_wordpress_command = "grep WordPress $path/license.txt 2>/dev/null|wc -l 2>/dev/null";
+
+	print "Running `$test_for_drupal_command`\n" if $VERBOSE;	
+	sshopen2($host, *READER3, *WRITER3, $test_for_drupal_command);
+  my $line;
+	$line = <READER3>;
+  return 'Drupal' if $line > 0;
+
+	print "Running `$test_for_wordpress_command`\n" if $VERBOSE;	
+	sshopen2($host, *READER4, *WRITER4, $test_for_wordpress_command);
+	$line = <READER4>;
+  return 'WordPress' if $line > 0;
 }
 
 sub generate_check_vhost_config_files {
@@ -1486,6 +1559,32 @@ sub print_statistics {
 	}
 	
 	$LOGGER->level($level);
+}
+
+sub get_and_send_web_application_status_to_nagios {
+	# get all hosts associated with Drupal, log in and check for module updates
+
+	# TODO: should we poll the system to find the user that apache is running as?
+	my $check_drupal_cmd = "/usr/bin/check_drupal.pl ups ";
+	
+	my $sth = $DBH->prepare(
+	'SELECT host.name as hostname, host.nagios_host_name as nagios_hostname,
+		vhost.name as vhostname, 
+		vhost_application.path as path
+		FROM host
+		LEFT JOIN vhost ON (host.host_id = vhost.host_id)
+		LEFT JOIN vhost_application ON ( vhost.vhost_id = vhost_application.vhost_id)
+		WHERE vhost_application.type=?
+	');
+
+	$sth->execute('Drupal');
+	while (my $result = $sth->fetchrow_hashref()) {
+		my $vhosts = sshopen2($result->{hostname}, *READER5, *WRITER5, 
+			$check_drupal_cmd .'-p '. $result->{path});
+		while (my $line = <READER5>) {
+			print $result->{vhostname} .": $line" if $VERBOSE;
+		}
+	}
 }
 
 sub usage {
