@@ -58,6 +58,8 @@ open (WP, $wp_check_core_update .' 2>&1 |') or die "Could not run $wp_check_core
 my $jsonText;
 while (my $line = <WP>) {
         $jsonText .= $line;
+	$np->nagios_exit(CRITICAL, "Its not going to work out between us: $1")
+		if $line =~ /Error: (.*)/;
 }
 close WP;
 
@@ -67,8 +69,9 @@ close WP;
 if ($jsonText =~ /Fatal error/) {
   $np->add_message(CRITICAL, "Running '$wp_check_core_update' returned an error.");
   $jsonText = '';
-} elsif ( $jsonText =~ m/Error: (.*)/s ) {
-	$np->nagios_exit(CRITICAL, "Its not going to work out between us: $1");
+} elsif ( $jsonText =~ m/([^\[]*)([\[].*)$/s ) {
+	# Its possible there is a bunch of warning messages at the begining
+	$jsonText = $2;
 }
 goto CHECKPLUGINS if !$jsonText;
 
@@ -97,6 +100,11 @@ close WP;
 if ($jsonText =~ /Fatal error/) {
   $np->add_message(CRITICAL, "Running '$wp_check_plugin_update' returned an error.");
   $jsonText = '';
+} elsif ( $jsonText =~ m/Error: (.*)\n/s ) {
+	$np->nagios_exit(CRITICAL, "Its not going to work out between us: $1");
+} elsif ( $jsonText =~ m/([^\{\[]*)([\[\{].*)/s ) {
+	# Its possible there is a bunch of warning messages at the begining
+	$jsonText = $2;
 }
 goto EXIT if !$jsonText;
 
