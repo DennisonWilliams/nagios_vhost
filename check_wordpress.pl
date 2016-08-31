@@ -37,8 +37,18 @@ my $wp_check_plugin_update = "$wp --format=json --path=$path --dry-run --all plu
 
 print "Checking WordPress core version: $wp_check_core_version\n"
   if $np->opts->verbose;
-open (WP, $wp_check_core_version .'|') or die "Could not run $wp_check_core_version";
-my $installed_core = <WP>;
+open (WP, $wp_check_core_version .' 2>&1 |') or die "Could not run $wp_check_core_version";
+my $installed_core;
+while (my $line = <WP>) {
+	# If it starts with a number we assume it is the version and bail
+	if ($line =~ /^\d/) {
+		$installed_core = $line;
+		last;
+	} elsif ( $line =~ /^Error: (.*)$/ ) {
+		$np->nagios_exit(CRITICAL, "Things didnt start well: $1");
+	}
+}
+
 close WP;
 chomp $installed_core;
 
@@ -52,12 +62,15 @@ while (my $line = <WP>) {
 close WP;
 
 # If $jsonText2 is empty it could also be because there are not updates
+# TODO: Verify this is not needed
+# if ($jsonText =~ m/Fatal error/s) { 
 if ($jsonText =~ /Fatal error/) {
   $np->add_message(CRITICAL, "Running '$wp_check_core_update' returned an error.");
   $jsonText = '';
+} elsif ( $jsonText =~ m/Error: (.*)/s ) {
+	$np->nagios_exit(CRITICAL, "Its not going to work out between us: $1");
 }
 goto CHECKPLUGINS if !$jsonText;
-
 
 my $jsonO = $json->decode($jsonText);
 my $core_updates;
