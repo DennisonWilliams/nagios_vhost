@@ -688,8 +688,11 @@ sub collect_vhosts_from_webservers {
 	my ($hosts) = @_;
 	my $sth = $DBH->prepare('SELECT host_id,name from host')
 		|| die "$DBI::errstr";;
-	my $stv = $DBH->prepare('SELECT * from vhost where host_id=?')
-		|| die "$DBI::errstr";;
+	my $stv = $DBH->prepare('
+		SELECT * from vhost 
+		LEFT JOIN vhost_application on (vhost.vhost_id = vhost_application.vhost_id)
+		WHERE host_id=?
+	') || die "$DBI::errstr";;
 	my $stvd = $DBH->prepare('DELETE from vhost where vhost_id=?')
 		|| die "$DBI::errstr";;
 	my $stvu = $DBH->prepare('UPDATE vhost set ip = ? where vhost_id = ?')
@@ -813,6 +816,7 @@ sub collect_vhosts_from_webservers {
 
 				foreach my $comment (@server_comments) {
 					if (my ($url, $response, $qs) = $comment->value =~ /^monitor (\S+)(?:\s(\d+))?(?:\s(\S.*))?$/i) {
+						$qs = $qs?$qs:'';
 						$qs =~ s/^"//;
 						$qs =~ s/"$//;
 						$vhosts{$vhost}{$port}{urls}{$url}{'response'} = ($response =~ /\d{3}/) ? $response : 200;
@@ -918,11 +922,15 @@ sub check_vhost_application_type {
 	sshopen2($host, *READER3, *WRITER3, $test_for_drupal_command);
   my $line;
 	$line = <READER3>;
+	close READER3;
+	close WRITER3;
   return 'Drupal' if $line > 0;
 
 	print "\tRunning `$test_for_wordpress_command`\n" if $VERBOSE >1;	
 	sshopen2($host, *READER4, *WRITER4, $test_for_wordpress_command);
 	$line = <READER4>;
+	close READER4;
+	close WRITER4;
   return 'WordPress' if $line > 0;
 }
 
@@ -1042,7 +1050,7 @@ sub generate_nagios_config_files {
 		my $short_hostname = $1;
 		print "Creating vhost config file for ". $host->{name} ."(". $NAGIOSCONFIGDIR . $host->{name} ."_vhosts.cfg...\n" 
 			if $VERBOSE;
-		open (HOSTFILE, '+>', $NAGIOSCONFIGDIR . $host->{name} .'_vhosts.cfg')
+		open (HOSTFILE, '>', $NAGIOSCONFIGDIR . $host->{name} .'_vhosts.cfg')
 			|| die('Could not open the vhost config file ('. $NAGIOSCONFIGDIR . $host->{name} .'_vhosts.cfg' .'): '. $?);
 		$stv->execute($host->{host_id});
 		my ($cluster, $wp_cluster, $drupal_cluster);
@@ -1085,23 +1093,27 @@ sub generate_nagios_config_files {
 					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
 			}
 
+			# Generate the configs for the vhost urls found in the apache config
+			# comments.  Its possible there is no path
 			$stvu->execute($vhost->{vhost_id});
 			while (my $vuhost = $stvu->fetchrow_hashref()) {
+				my $path = $vuhost->{path}?$vuhost->{path}:'';
+
 				print HOSTFILE "define service {\n".
 					"\tuse generic-service-passive-no-notification-no-perfdata\n".
-					"\tservice_description ". $vuhost->{name} .':'. $vhost->{port} . $vuhost->{path} .' on '. $host->{name} ."\n".
+					"\tservice_description ". $vuhost->{name} .':'. $vhost->{port} . $path .' on '. $host->{name} ."\n".
 					"\tservicegroups ". $host->{name} ."_urls\n".
 					"\thost_name $short_hostname\n}\n\n";
 
 				$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
-					$vuhost->{name} .':'. $vhost->{port} . $vuhost->{path} .' on '. 
+					$vuhost->{name} .':'. $vhost->{port} . $path .' on '. 
 					$host->{name} .'$,';
 
 				print HOSTFILE "define servicedependency {\n".
 					"\thost_name $short_hostname\n".
 					"\tservice_description HTTP\n".
 					"\tdependent_host_name $short_hostname\n".
-					"\tdependent_service_description ". $vuhost->{name} .':'. $vhost->{port} . $vuhost->{path} .' on '. $host->{name} ."\n".
+					"\tdependent_service_description ". $vuhost->{name} .':'. $vhost->{port} . $path .' on '. $host->{name} ."\n".
 					"\texecution_failure_criteria n\n".
 					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
 			}
@@ -1169,13 +1181,15 @@ sub generate_nagios_config_files {
 			"\tuse generic-service\n".
 			"\tservice_description Drupal Updates\n".
 			"\thost_name $short_hostname\n".
-			"\tcheck_command check_service_cluster!\"Drupal Updates\"!0!1!$drupal_cluster\n}\n\n";
+			"\tcheck_command check_service_cluster!\"Drupal Updates\"!0!1!$drupal_cluster\n}\n\n"
+			if $drupal_cluster;
 
 		print HOSTFILE "define service{\n".
 			"\tuse generic-service\n".
 			"\tservice_description WordPress Updates\n".
 			"\thost_name $short_hostname\n".
-			"\tcheck_command check_service_cluster!\"Wordpress Updates\"!0!1!$wp_cluster\n}\n\n";
+			"\tcheck_command check_service_cluster!\"Wordpress Updates\"!0!1!$wp_cluster\n}\n\n"
+			if $wp_cluster;
 
 		close HOSTFILE;
 	}
@@ -1634,13 +1648,17 @@ sub get_and_send_web_application_status_to_nagios {
 		LEFT JOIN vhost ON (host.host_id = vhost.host_id)
 		LEFT JOIN vhost_application ON ( vhost.vhost_id = vhost_application.vhost_id)
 		WHERE vhost_application.type=?
+		AND nagios_hostname="rockwood"
 	');
 
 	$sth->execute('Drupal');
 	while (my $result = $sth->fetchrow_hashref()) {
+		print "\tradicaldesigns\@". $result->{hostname} ."# $check_drupal_cmd ".
+			$result->{path} ." --uri=". $result->{vhostname} ."\n"
+			if $VERBOSE;
+
 		my $vhosts = sshopen2($result->{hostname}, *READER5, *WRITER5, 
 			$check_drupal_cmd . $result->{path} ." --uri=". $result->{vhostname});
-			#$check_drupal_cmd . $result->{path} ." --verbose");
 		while (my $line = <READER5>) {
 			# RETURN CODES:
 			# 0-OK, 1-WARNING, 2-CRITICAL, 3-UNKNOWN
@@ -1664,6 +1682,11 @@ sub get_and_send_web_application_status_to_nagios {
 
 	$sth->execute('WordPress');
 	while (my $result = $sth->fetchrow_hashref()) {
+
+		print "\tradicaldesigns\@". $result->{hostname} ."# $check_wordpress_cmd". 
+			$result->{path} ."\n"
+			if $VERBOSE;
+
 		sshopen2($result->{hostname}, *READER6, *WRITER6, $check_wordpress_cmd .$result->{path});
 		while (my $line = <READER6>) {
 
@@ -1722,7 +1745,20 @@ webservers for vhosts, and will update the nagios vhost config files.
                                      list of [server_list].  If [server_list] 
                                      is not specified then poll all web servers
                                      configured in the db.
+--web-application-status-to-nagios : This flag will log into each host that has
+                                     web applications associated with enabled
+                                     vhosts and check for available updates.
+                                     Installation of check_wordpress and
+                                     check_drupal on the remote host is assumed
+--nsca-host                        : The NSCA host address to send the results
+                                     of --web-application-status-to-nagios to.
+                                     DEFAULT: localhost
+--nsca-config                      : The send_nsca config to use when sending
+                                     results from 
+                                     --web-application-status-to-nagios DEFAULT
+                                     /etc/send_nsca.cfg
 --verbose                          : Repeat this option to increase verbosity
 --help                             : This help message
 END
 }
+
