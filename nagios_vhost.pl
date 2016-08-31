@@ -1670,6 +1670,11 @@ sub get_and_send_web_application_status_to_nagios {
 			$rc = 2 if $line =~ /CRITICAL/;
 			$rc = 3 if $line =~ /UNKNOWN/;
 
+			print "\t\t". $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
+				$result->{port} .' on '. $result->{hostname} ." ". $result->{type} .
+				" Updates\t$rc\t$line"
+				if $VERBOSE>1;
+
 			print NSCA $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
 				$result->{port} .' on '. $result->{hostname} ." ". $result->{type} .
 				" Updates\t$rc\t$line";
