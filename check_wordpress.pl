@@ -1,11 +1,14 @@
 #!/usr/bin/perl -w
+use Env;
+use lib "$HOME/perl5/lib/perl5";
 #use strict;
-use Nagios::Plugin;
+use Nagios::Plugin "0.36";
 use Data::Dumper;
 use File::Basename;
 use JSON;
 
-my $wp = '/usr/bin/wp ';
+# This has to be in the users path
+my $wp = 'wp ';
 my $VERSION = '0.1';
 my $np = Nagios::Plugin->new(
   usage => "Usage: %s [ -v|--verbose ] [ -p|--path ]",
@@ -66,21 +69,23 @@ close WP;
 # If $jsonText2 is empty it could also be because there are not updates
 # TODO: Verify this is not needed
 # if ($jsonText =~ m/Fatal error/s) { 
-if ($jsonText =~ /Fatal error/) {
+if ($jsonText && $jsonText =~ /Fatal error/) {
   $np->add_message(CRITICAL, "Running '$wp_check_core_update' returned an error.");
   $jsonText = '';
-} elsif ( $jsonText =~ m/([^\[]*)([\[].*)$/s ) {
+} elsif ( $jsonText && $jsonText =~ m/([^\[]*)([\[].*)$/s ) {
 	# Its possible there is a bunch of warning messages at the begining
 	$jsonText = $2;
 }
 goto CHECKPLUGINS if !$jsonText;
 
-my $jsonO = $json->decode($jsonText);
+my $updates = $json->decode($jsonText);
 my $core_updates;
 my $severity = OK;
-foreach my $index (keys $jsonO) {
+#print Dumper($jsonText);
+#print Dumper($updates); exit;
+foreach my $update (keys @$updates) {
         $core_updates .=', ' if $core_updates;
-        $core_updates .= $jsonO->[$index]->{version};
+        $core_updates .= $update->{version}?$update->{version}:'';
 }
 $np->add_message(CRITICAL, "Core ". $installed_core ." < (". $core_updates .") ")
   if $core_updates;
@@ -109,10 +114,10 @@ if ($jsonText =~ /Fatal error/) {
 goto EXIT if !$jsonText;
 
 $jsonO = $json->decode($jsonText);
-foreach my $index (keys $jsonO) {
-        my $plugin_updates .= $jsonO->[$index]->{name} .' ('.
-          $jsonO->[$index]->{version} .' < '.
-          $jsonO->[$index]->{update_version} .' )';
+foreach my $update (@$jsonO) {
+        my $plugin_updates .= $update->{name} .' ('.
+          $update->{version} .' < '.
+          $update->{update_version} .' )';
         $np->add_message(CRITICAL, $plugin_updates);
 }
 
