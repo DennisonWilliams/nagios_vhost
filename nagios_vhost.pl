@@ -8,6 +8,7 @@ use File::Basename;
 use Cwd 'abs_path';
 use Net::SSH qw(ssh_cmd sshopen2);
 use Net::DNS;
+use Net::IP::Match::Regexp qw( create_iprange_regexp match_ip );
 
 package Apache::ConfigParserWithFileHandle;
 use Scalar::Util qw(openhandle);
@@ -711,9 +712,9 @@ sub collect_vhosts_from_webservers {
 		|| die "$DBI::errstr";;
 	my $stvapi = $DBH->prepare('INSERT INTO vhost_application(vhost_id, type, path) values(?, ?, ?)')
 		|| die "$DBI::errstr";;
+	my $stvur = $DBH->prepare('UPDATE vhost set response = ?, query_string = ? where name = ?')
+		|| die "$DBI::errstr";;
 
-
-	my $get_vhosts_cmd = "PATH=\$PATH:/usr/sbin; sudo apachectl -t -D DUMP_VHOSTS";
 	my $get_config_file_cmd = "/bin/cat ";
 
 	# If we are passed in a host list, then process it
@@ -754,8 +755,17 @@ sub collect_vhosts_from_webservers {
 			die "query failed(". $host->{name} ."): ". $res->errorstring;
 		}
 
+		my $get_vhosts_cmd = "PATH=\$PATH:/usr/sbin; apachectl -t -D DUMP_VHOSTS";
 		print "Running `$get_vhosts_cmd`\n" if $VERBOSE;	
 		my $vhosts = sshopen2($host->{name}, *READER, *WRITER, $get_vhosts_cmd);
+
+		# FIXME: Make this solution more elegant
+		# This is a work around for trying different commands on differrent
+		# architectures to get the apache vhost list
+		$get_vhosts_cmd = "apachectl -t -D DUMP_VHOSTS";
+		$vhosts = sshopen2($host->{name}, *READER, *WRITER, $get_vhosts_cmd)
+			unless <READER>;
+
 		while (<READER>) {
 			my $vhost_line = $_;
 			next if ($vhost_line !~ /port (\d+) namevhost ([^\s]+) \(([^:]+):\d+\)/);
@@ -790,17 +800,31 @@ sub collect_vhosts_from_webservers {
 				my @virtual_hosts = $acp->find_siblings_and_up_directive_names($sn, 'virtualhost');
 				my @document_roots = $acp->find_siblings_and_up_directive_names($sn, 'documentroot');
 				my $server_name  = $sn->value;
-				my $document_root = $document_roots[0]->value;
+				my $document_root = $document_roots[0]?$document_roots[0]->value:'';
 				my $virtual_host = $virtual_hosts[0]->value;
 
 				next if ($server_name ne $vhost);
+
+				# This code should prevent vhosts from ending up without an ip
 				next if ($virtual_host !~ /([^:]+):$port/);
 				my $vhost_ip = $1;
 				$vhosts{$vhost}{$port}{ip} = $ip;
-				if ($vhost_ip && ($vhost_ip ne '*') && ($vhost_ip !~ /\s/)) {
+				my $regexp = create_iprange_regexp(
+              qw( 10.0.0.0/8 87.134.66.128 87.134.87.0/24 145.97.0.0/16 )
+           );
+				if (
+					$vhost_ip && 
+					($vhost_ip ne '*') && 
+					($vhost_ip !~ /\s/) &&
+
+					# EE's vhosts are actually on an internal ip proxied from its public ip
+					!match_ip($vhost_ip, $regexp)
+				) {
 					$vhosts{$vhost}{$port}{ip} = $vhost_ip;
 				}
 
+				$vhosts{$vhost}{$port}{port} = $port;
+				$vhosts{$vhost}{$port}{name} = $vhost;
 				# Record where the documentroot is
 				$vhosts{$vhost}{$port}{documentroot} = $document_root;
 				# Log back into the server and attempt to determine the application type
@@ -862,15 +886,21 @@ sub collect_vhosts_from_webservers {
 
 			print "\tInserting ". $vhosts{$vhost->{name}}{$vhost->{port}}{application} ." as application for ". $vhost->{name} .":". $vhost->{port} ."...\n" 
 				if $VERBOSE && $vhosts{$vhost->{name}}{$vhost->{port}}{application};	
-			$stvapi->execute($vhost->{vhost_id}, $vhosts{$vhost->{name}}{$vhost->{port}}{application}, $vhosts{$vhost->{name}}{$vhost->{port}}{documentroot})
-				if $vhosts{$vhost->{name}}{$vhost->{port}}{application};	
 
-			# TODO: if the url is actually a vhost or vhost_alias, update that instead of 
-			# adding a row in the urls table
+			if ($vhosts{$vhost->{name}}{$vhost->{port}}{application}) {
+				$stvapi->execute(
+					$vhost->{vhost_id}, 
+					$vhosts{$vhost->{name}}{$vhost->{port}}{application}, 
+					$vhosts{$vhost->{name}}{$vhost->{port}}{documentroot}
+				);
+			}
+
 			# We just remove the urls and add the ones we found
 			print "\tRemoving urls for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
 			$stud->execute($vhost->{vhost_id});
 
+			# If the url is actually a vhost or vhost_alias, update that instead of 
+			# adding a row in the urls table
 			foreach my $url (keys %{$vhosts{$vhost->{name}}{$vhost->{port}}{urls}}) {
 				$url =~ /([^\/]*)(\/.*)/;
 				my $name = $1 ? $1 : $vhost->{name};
@@ -878,8 +908,12 @@ sub collect_vhosts_from_webservers {
 				my $response = $vhosts{$vhost->{name}}{$vhost->{port}}{urls}{$url}{response};
 				my $query_string = $vhosts{$vhost->{name}}{$vhost->{port}}{urls}{$url}{query_string};
 			  print "\tInserting $url as url for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
-				
-				$stvui->execute($vhost->{vhost_id}, $name, $path, $response, $query_string);
+				# Argument "staff.radicaldesigns.org" isn't numeric in numeric eq (==) at /home/radicaldesigns/src/nagios_vhost_drush/nagios_vhost.pl line 890, <READER> line 19.
+				if (!$path && ($name eq $vhost->{name})) { 
+					$stvur->execute($response, $query_string, $name);
+				} else {
+					$stvui->execute($vhost->{vhost_id}, $name, $path, $response, $query_string);
+				}
 			}
 			delete($vhosts{$vhost->{name}}{$vhost->{port}});
 		}
@@ -924,14 +958,14 @@ sub check_vhost_application_type {
 	$line = <READER3>;
 	close READER3;
 	close WRITER3;
-  return 'Drupal' if $line > 0;
+  return 'Drupal' if $line && ($line > 0);
 
 	print "\tRunning `$test_for_wordpress_command`\n" if $VERBOSE >1;	
 	sshopen2($host, *READER4, *WRITER4, $test_for_wordpress_command);
 	$line = <READER4>;
 	close READER4;
 	close WRITER4;
-  return 'WordPress' if $line > 0;
+  return 'WordPress' if $line && ($line > 0);
 }
 
 sub generate_check_vhost_config_files {
@@ -1212,9 +1246,9 @@ sub run_checks_as_daemon {
 
 	$LOGGER = get_logger("Daemon");
 	$LOGGER->add_appender($appender);
-	#$LOGGER->level($INFO);
+	$LOGGER->level($INFO);
 	#$LOGGER->level($WARN);
-	$LOGGER->level($DEBUG);
+	#$LOGGER->level($DEBUG);
 	$LOGGER->debug('Logger initialized');
 
 	my @servers;
@@ -1278,7 +1312,7 @@ sub response_redirect {
 		# This is an ugly fix, but to help keep us from ending up in the 
 		# redirection loop then we need to check against a possible 
 		# redirection location set in the check_host method.
-    $LOGGER->info("redirectissue: ". $response->header('Location') ." <==> $LOCATION") if ($LOCATION =~ /radicaldesigns.org/);
+    $LOGGER->info("response_redirect() redirectissue: ". $response->header('Location') ." <==> $LOCATION") if ($LOCATION =~ /radicaldesigns.org/);
 		if ($response->header('Location') eq $LOCATION) {
 			$LOCATION = 'matched';
 			return;
@@ -1540,6 +1574,7 @@ sub check_host {
 
 	# TODO: is this a problem with the special characters in a url?
 	if ($LOCATION ne 'matched' && $rc =~ /3\d\d/ ) {
+    $LOGGER->warn("NO302: ${http}://${ip}${path} (HOST => $name): $LOCATION");
 		$response .= " Did NOT $rc to expected location: $query_string";
 		$code=2;
 	} elsif ($LOCATION eq 'matched' && $rc =~ /3\d\d/) {
@@ -1648,7 +1683,6 @@ sub get_and_send_web_application_status_to_nagios {
 		LEFT JOIN vhost ON (host.host_id = vhost.host_id)
 		LEFT JOIN vhost_application ON ( vhost.vhost_id = vhost_application.vhost_id)
 		WHERE vhost_application.type=?
-		AND nagios_hostname="rockwood"
 	');
 
 	$sth->execute('Drupal');
