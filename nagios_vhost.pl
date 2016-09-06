@@ -344,6 +344,7 @@ our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
 our ($UPDATEWEBSERVERS, $LOCATION, $WEBAPPLICATIONSTATUSTONAGIOS);
+our ($DATABASE, $USERNAME, $PASSWORD);
 
 # The following globals are used to send web application update status to nsca
 our ($NSCA, $NSCA_HOST, $NSCA_CONFIG);
@@ -363,23 +364,30 @@ $DBFILE = dirname(abs_path($0)) .'/.'. basename($0) .'.db';
 $NAGIOSCONFIGDIR = '/etc/nagios3/conf.d/';
 $USENSCA = 0;
 $CMD_FILE = '/var/lib/nagios3/rw/nagios.cmd';
+
+$DATABASE = 'nagios_vhost';
+$USERNAME = 'nagios_vhost';
+$PASSWORD = 'nagios_vhost';
 my $help;
 
 my $result = GetOptions (
-	"query-string:s" => \$QUERYSTRING,
-	"add-web-server:s" => \$ADDWEBSERVER,
-	"get-web-servers" => \$GETWEBSERVERS,
-	"add-vhost-query-string:s" => \$ADDVHOSTQUERYSTRING,
-	"nagios-config-dir:s" => \$NAGIOSCONFIGDIR,
-	"update-web-servers:s" => \$UPDATEWEBSERVERS,
+	"query-string:s"                   => \$QUERYSTRING,
+	"add-web-server:s"                 => \$ADDWEBSERVER,
+	"get-web-servers"                  => \$GETWEBSERVERS,
+	"add-vhost-query-string:s"         => \$ADDVHOSTQUERYSTRING,
+	"nagios-config-dir:s"              => \$NAGIOSCONFIGDIR,
+	"update-web-servers:s"             => \$UPDATEWEBSERVERS,
 	"web-application-status-to-nagios" => \$WEBAPPLICATIONSTATUSTONAGIOS,
-	"daemon"    => \$DAEMON,
-	"use-nsca"    => \$USENSCA,
-	"external-command-file:s"    => \$CMD_FILE,
-	"nsca-host:s"    => \$NSCA_HOST,
-	"nsca-config:s"    => \$NSCA_CONFIG,
-	"verbose+"    => \$VERBOSE,
-	"help" => \$help
+	"daemon"                           => \$DAEMON,
+	"use-nsca"                         => \$USENSCA,
+	"external-command-file:s"          => \$CMD_FILE,
+	"nsca-host:s"                      => \$NSCA_HOST,
+	"nsca-config:s"                    => \$NSCA_CONFIG,
+	"database:s"                       => \$DATABASE,
+	"username:s"                       => \$USERNAME,
+	"password:s"                       => \$PASSWORD,
+	"verbose+"                         => \$VERBOSE,
+	"help"                             => \$help
 );
 
 if ($help) {
@@ -419,27 +427,27 @@ sub initDB{
 		#`touch $DBFILE`;
 	#}
 
-	print "Initializing application database (". $DBFILE .")\n"
+	print "Initializing application database (". $DATABASE .")\n"
 		if $VERBOSE;	
+
 	# Connect to the database
-	# TODO: add RaiseError
-	$DBH = DBI->connect("dbi:SQLite:dbname=$DBFILE", "", "",{ 
+	my $dsn = "DBI:mysql:database=$DATABASE";
+	$DBH = DBI->connect($dsn, $USERNAME, $PASSWORD,{ 
 		RaiseError => 1,
 		sqlite_use_immediate_transaction => 1 })
 			|| die "Could not connect to database: $DBI::errstr";
-
-	# This needs to get done so that sqlite3 honors the FK constraints
-	$DBH->do("PRAGMA foreign_keys = ON");
 
 	# TODO: this will generate a error if the schema has not been installed yet,
 	# but will not fail.
 	$sth = $DBH->prepare( 
 		"SELECT value FROM variables WHERE `key`='schema_version'"
 	);
-	if (defined($DBI::errstr) && $DBI::errstr =~ /no such table/) {
+	eval {
+		$sth->execute();
+	}; if ($@ && $DBI::errstr && $DBI::errstr =~ /Table \'$DATABASE.variables\' doesn\'t exist/) {
 		install();
 		$sth = $DBH->prepare("INSERT INTO variables(`key`, `value`) values(?, ?)");
-		$sth->execute('schema_version', 5);
+		$sth->execute('schema_version', 7);
 	} else {
 	
 		$sth->execute();
@@ -571,7 +579,7 @@ sub install {
 	# actually ssh to / web client to
 	$sth = $DBH->prepare(
 		"CREATE TABLE host (
-			host_id INTEGER PRIMARY KEY,
+			host_id INTEGER PRIMARY KEY AUTO_INCREMENT,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255) NOT NULL,
 			`nagios_host_name` VARCHAR(255),
@@ -588,7 +596,7 @@ sub install {
 	$sth = $DBH->prepare(
 		"CREATE TABLE vhost (
 			host_id INTEGER,
-			vhost_id INTEGER PRIMARY KEY,
+			vhost_id INTEGER PRIMARY KEY AUTO_INCREMENT,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255),
 			ip VARCHAR(15),
@@ -714,6 +722,8 @@ sub collect_vhosts_from_webservers {
 		|| die "$DBI::errstr";;
 	my $stvur = $DBH->prepare('UPDATE vhost set response = ?, query_string = ? where name = ?')
 		|| die "$DBI::errstr";;
+	my $stvuvar = $DBH->prepare('UPDATE vhost_alias set response = ?, query_string = ? where name = ?')
+		|| die "$DBI::errstr";;
 
 	my $get_config_file_cmd = "/bin/cat ";
 
@@ -755,16 +765,9 @@ sub collect_vhosts_from_webservers {
 			die "query failed(". $host->{name} ."): ". $res->errorstring;
 		}
 
-		my $get_vhosts_cmd = "PATH=\$PATH:/usr/sbin; apachectl -t -D DUMP_VHOSTS";
+		my $get_vhosts_cmd = "apachectl -t -D DUMP_VHOSTS";
 		print "Running `$get_vhosts_cmd`\n" if $VERBOSE;	
 		my $vhosts = sshopen2($host->{name}, *READER, *WRITER, $get_vhosts_cmd);
-
-		# FIXME: Make this solution more elegant
-		# This is a work around for trying different commands on differrent
-		# architectures to get the apache vhost list
-		$get_vhosts_cmd = "apachectl -t -D DUMP_VHOSTS";
-		$vhosts = sshopen2($host->{name}, *READER, *WRITER, $get_vhosts_cmd)
-			unless <READER>;
 
 		while (<READER>) {
 			my $vhost_line = $_;
@@ -854,7 +857,10 @@ sub collect_vhosts_from_webservers {
 		}
 
 		# We can't just delete the hosts because users may have added 
-		# query_strings for them that need to be persistent.
+		# query_strings for them that need to be persistent.  If there is
+		# a custom query_string or response added for a vhost, or vhost_alias
+		# and there is a 'monitor' comment in the vhost config, the 'monitor'
+		# entry will take precedence
 		# Disable all vhosts that exist in the database that were not returned
 		$stv->execute($host->{host_id});
 		while (my $vhost = $stv->fetchrow_hashref()) {
@@ -884,7 +890,8 @@ sub collect_vhosts_from_webservers {
 			print "\tRemoving vhost_application rows for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
 			$stvapd->execute($vhost->{vhost_id});
 
-			print "\tInserting ". $vhosts{$vhost->{name}}{$vhost->{port}}{application} ." as application for ". $vhost->{name} .":". $vhost->{port} ."...\n" 
+			print "\tInserting ". $vhosts{$vhost->{name}}{$vhost->{port}}{application} .
+				" as application for ". $vhost->{name} .":". $vhost->{port} ."...\n" 
 				if $VERBOSE && $vhosts{$vhost->{name}}{$vhost->{port}}{application};	
 
 			if ($vhosts{$vhost->{name}}{$vhost->{port}}{application}) {
@@ -907,13 +914,20 @@ sub collect_vhosts_from_webservers {
 				my $path = $2;
 				my $response = $vhosts{$vhost->{name}}{$vhost->{port}}{urls}{$url}{response};
 				my $query_string = $vhosts{$vhost->{name}}{$vhost->{port}}{urls}{$url}{query_string};
-			  print "\tInserting $url as url for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
-				# Argument "staff.radicaldesigns.org" isn't numeric in numeric eq (==) at /home/radicaldesigns/src/nagios_vhost_drush/nagios_vhost.pl line 890, <READER> line 19.
-				if (!$path && ($name eq $vhost->{name})) { 
-					$stvur->execute($response, $query_string, $name);
-				} else {
-					$stvui->execute($vhost->{vhost_id}, $name, $path, $response, $query_string);
-				}
+
+				print "\tInserting $url as url for ". $vhost->{name} .":". $vhost->{port} ."...\n" 
+					if $VERBOSE;
+
+				# Update the corresponding vhost row, then start over
+				$stvur->execute($response, $query_string, $name) && next
+					if (!$path && ($name eq $vhost->{name}));
+
+				# Update the corresponding vhost_alias row, then start over
+				$stvuvar->execute($response, $query_string, $name) && next
+					if (!$path && grep(/$name/, @{$vhosts{$vhost->{name}}{$vhost->{port}}{aliases}}));
+
+				# If there is a path, its a url
+				$stvui->execute($vhost->{vhost_id}, $name, $path, $response, $query_string);
 			}
 			delete($vhosts{$vhost->{name}}{$vhost->{port}});
 		}
@@ -925,7 +939,7 @@ sub collect_vhosts_from_webservers {
 				my $port = $_;
 				print "Adding new vhost: $vhost:$port (". $host->{host_id} .")...\n" if $VERBOSE;
 				$stvi->execute($host->{host_id}, $vhost, $port, $vhosts{$vhost}{$port}{ip});
-				my $rowid = $DBH->func('last_insert_rowid');
+				my $rowid = $stvi->{mysql_insertid};
 
 				foreach (@{$vhosts{$vhost}{$port}{aliases}}) {
 					print "Adding $_ as alias for $vhost:$port...\n" if $VERBOSE;
@@ -947,25 +961,25 @@ sub collect_vhosts_from_webservers {
 
 sub check_vhost_application_type {
 	my ($host, $path) = @_;
-	print "check_vhost_application_type($host, $path)\n" if $VERBOSE>1;
+	print "\tcheck_vhost_application_type($host, $path)\n" if $VERBOSE>1;
 
-	my $test_for_drupal_command = "grep Drupal $path/CHANGELOG.txt 2>/dev/null|wc -l 2>/dev/null";
-	my $test_for_wordpress_command = "grep WordPress $path/license.txt 2>/dev/null|wc -l 2>/dev/null";
+	my $test_for_drupal_command = "grep Drupal $path/CHANGELOG.txt | wc -l ";
+	my $test_for_wordpress_command = "grep WordPress $path/license.txt | wc -l ";
 
 	print "\tRunning `$test_for_drupal_command`\n" if $VERBOSE >1;	
 	sshopen2($host, *READER3, *WRITER3, $test_for_drupal_command);
-  my $line;
+	my $line;
 	$line = <READER3>;
 	close READER3;
 	close WRITER3;
-  return 'Drupal' if $line && ($line > 0);
+	return 'Drupal' if $line && ($line > 0);
 
 	print "\tRunning `$test_for_wordpress_command`\n" if $VERBOSE >1;	
 	sshopen2($host, *READER4, *WRITER4, $test_for_wordpress_command);
 	$line = <READER4>;
 	close READER4;
 	close WRITER4;
-  return 'WordPress' if $line && ($line > 0);
+	return 'WordPress' if $line && ($line > 0);
 }
 
 sub generate_check_vhost_config_files {
@@ -1672,8 +1686,8 @@ sub print_statistics {
 # get all hosts associated with Drupal, log in and check for module updates
 sub get_and_send_web_application_status_to_nagios {
 
-	my $check_drupal_cmd = "/usr/bin/check_drupal.pl -p ";
-	my $check_wordpress_cmd = "/usr/bin/check_wordpress -p ";
+	my $check_drupal_cmd = "check_drupal.pl -p ";
+	my $check_wordpress_cmd = "check_wordpress.pl -p ";
 	
 	my $sth = $DBH->prepare(
 	'SELECT host.name as hostname, host.nagios_host_name as nagios_hostname,
@@ -1687,7 +1701,7 @@ sub get_and_send_web_application_status_to_nagios {
 
 	$sth->execute('Drupal');
 	while (my $result = $sth->fetchrow_hashref()) {
-		print "\tradicaldesigns\@". $result->{hostname} ."# $check_drupal_cmd ".
+		print "\t". $result->{hostname} ."\$ $check_drupal_cmd ".
 			$result->{path} ." --uri=". $result->{vhostname} ."\n"
 			if $VERBOSE;
 
@@ -1697,14 +1711,14 @@ sub get_and_send_web_application_status_to_nagios {
 			# RETURN CODES:
 			# 0-OK, 1-WARNING, 2-CRITICAL, 3-UNKNOWN
 			open(NSCA, "|$NSCA -H $NSCA_HOST -c $NSCA_CONFIG") or 
-				die "could not start nsca: $NSCA -H $NSCA_HOST -c $NSCA_CONFIG";
+				die "could not start nsca: $NSCA -H $NSCA_HOST -c $NSCA_CONFIG"
 
 			my $rc = 0;
 			$rc = 1 if $line =~ /WARNING/;
 			$rc = 2 if $line =~ /CRITICAL/;
 			$rc = 3 if $line =~ /UNKNOWN/;
 
-			print "\t\t". $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
+			print "\t". $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
 				$result->{port} .' on '. $result->{hostname} ." ". $result->{type} .
 				" Updates\t$rc\t$line"
 				if $VERBOSE>1;
@@ -1722,7 +1736,7 @@ sub get_and_send_web_application_status_to_nagios {
 	$sth->execute('WordPress');
 	while (my $result = $sth->fetchrow_hashref()) {
 
-		print "\tradicaldesigns\@". $result->{hostname} ."# $check_wordpress_cmd". 
+		print "\t". $result->{hostname} ."\$ $check_wordpress_cmd". 
 			$result->{path} ."\n"
 			if $VERBOSE;
 
@@ -1736,6 +1750,11 @@ sub get_and_send_web_application_status_to_nagios {
 
 			my $rc = 0;
 			$rc = 2 if $line =~ /CRITICAL/;
+
+			print "\t". $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
+				$result->{port} .' on '. $result->{hostname} ." ". $result->{type} .
+				" Updates\t$rc\t$line"
+				if $VERBOSE>1;
 
 			print NSCA $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
 				$result->{port} .' on '. $result->{hostname} ." ". $result->{type} .
@@ -1796,6 +1815,12 @@ webservers for vhosts, and will update the nagios vhost config files.
                                      results from 
                                      --web-application-status-to-nagios DEFAULT
                                      /etc/send_nsca.cfg
+--database                         : The MySQL databasse name to connect to 
+                                     DEFAULT: nagios_vhost
+--username                         : The MySQL username to connect with 
+                                     DEFAULT: nagios_vhost
+--password                         : The MySQL password to connect to MySQL 
+                                     with. DEFAULT: nagios_vhost
 --verbose                          : Repeat this option to increase verbosity
 --help                             : This help message
 END
