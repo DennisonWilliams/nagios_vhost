@@ -111,7 +111,7 @@ if ($jsonText =~ /Fatal error/) {
 	# Its possible there is a bunch of warning messages at the begining
 	$jsonText = $2;
 }
-goto EXIT if !$jsonText;
+goto EXIT if !$jsonText || $jsonText =~ /No plugin updates available/;
 
 $jsonO = $json->decode($jsonText);
 foreach my $update (@$jsonO) {
