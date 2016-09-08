@@ -1266,9 +1266,11 @@ sub run_checks_as_daemon {
   #$LOGGER->level($DEBUG);
 	#$LOGGER->debug('Logger initialized');
 
-	my @servers;
+	my $servers;
+	my $TERMD = 0;
 	$SIG{TERM} = sub { 
-		my @kids = keys @servers;
+		my @kids = keys %{$servers};
+		$TERMD = 1;
 		kill 9, @kids;
 	};
 	
@@ -1295,15 +1297,9 @@ sub run_checks_as_daemon {
 	}
 
 	while (my $host = $sth->fetchrow_hashref()) {
-		my $pid = fork();
-		if ($pid) {
-			$servers[$pid] = 1;
-			$LOGGER->debug('New process ('. $pid .') started to handle '. $host->{name} .' vhosts');
-		} else {
-			$0 = $0 ." [". $host->{name} ."]";
-			process_server_vhosts($host->{host_id}, $host->{name});
-			exit 0;
-		}
+		my $pid = fork_server($host->{host_id}, $host->{name});
+		$servers->{$pid}->{host_id} = $host->{host_id};
+		$servers->{$pid}->{name} = $host->{name};
 	}
 
 	# Don't abandon your children
@@ -1311,8 +1307,27 @@ sub run_checks_as_daemon {
 	do {
 		$kid = wait;	
 		$LOGGER->debug('Process ('. $kid .') exited');
+		if (!$TERMD) {
+			my $pid = fork_server($servers->{$kid}->{host_id}, $servers->{$kid}->{name});
+			$servers->{$pid}->{host_id} = $servers->{$kid}->{host_id};
+			$servers->{$pid}->{name} = $servers->{$kid}->{name};
+		}
+		delete $servers->{$kid};
 	} while $kid > 0;
 	exit;
+}
+
+sub fork_server {
+		my ($hostid, $hostname) = @_;
+		my $pid = fork();
+		if ($pid) {
+			$LOGGER->debug('New process ('. $pid .') started to handle '. $hostname .' vhosts');
+			return $pid;
+		} else {
+			$0 = $0 ." [". $hostname ."]";
+			process_server_vhosts($hostid, $hostname);
+			exit 0;
+		}
 }
 
 # We actually want to stay on the same server so we only chnage the HOST
@@ -1703,7 +1718,6 @@ sub get_and_send_web_application_status_to_nagios {
 		LEFT JOIN vhost ON (host.host_id = vhost.host_id)
 		LEFT JOIN vhost_application ON ( vhost.vhost_id = vhost_application.vhost_id)
 		WHERE vhost_application.type=?
-		AND host.nagios_host_name="harm"
 	');
 
 	$sth->execute('Drupal');
