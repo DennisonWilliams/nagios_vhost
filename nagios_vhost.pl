@@ -1264,7 +1264,7 @@ sub run_checks_as_daemon {
 	$LOGGER->level($INFO);
 	#$LOGGER->level($WARN);
   #$LOGGER->level($DEBUG);
-	$LOGGER->debug('Logger initialized');
+	#$LOGGER->debug('Logger initialized');
 
 	my @servers;
 	$SIG{TERM} = sub { 
