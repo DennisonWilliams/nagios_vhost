@@ -6,7 +6,7 @@ use Data::Dumper;
 use Getopt::Long;
 use File::Basename;
 use Cwd 'abs_path';
-use Net::SSH qw(ssh_cmd sshopen2);
+use Net::SSH qw(ssh_cmd sshopen2 sshopen3);
 use Net::DNS;
 use Net::IP::Match::Regexp qw( create_iprange_regexp match_ip );
 
@@ -434,8 +434,8 @@ sub initDB{
 	my $dsn = "DBI:mysql:database=$DATABASE";
 	$DBH = DBI->connect($dsn, $USERNAME, $PASSWORD,{ 
 		RaiseError => 1,
-		sqlite_use_immediate_transaction => 1 })
-			|| die "Could not connect to database: $DBI::errstr";
+		mysql_auto_reconnect => 1,
+	}) || die "Could not connect to database: $DBI::errstr";
 
 	# TODO: this will generate a error if the schema has not been installed yet,
 	# but will not fail.
@@ -613,8 +613,9 @@ sub install {
 			vhost_id INTEGER,
 			last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			name VARCHAR(255),
-			response INT NOT NULL DEFAULT 200,
-			query_string VARCHAR(255),
+			response INT DEFAULT NULL,
+			query_string VARCHAR(255) DEFAULT NULL,
+			UNIQUE KEY `vhost_alias_unique_vhost_id_name_index` (`vhost_id`,`name`),
 			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
 	)");
 	$sth->execute();
@@ -625,8 +626,8 @@ sub install {
 			vhost_id INTEGER,
 			name VARCHAR(255),
 			path VARCHAR(255),
-			response INT NOT NULL DEFAULT 200,
-			query_string VARCHAR(255),
+			response INT DEFAULT NULL,
+			query_string VARCHAR(255) DEFAULT NULL,
 			FOREIGN KEY(vhost_id) REFERENCES vhost(vhost_id) ON DELETE CASCADE
 	)");
 	$sth->execute();
@@ -706,7 +707,9 @@ sub collect_vhosts_from_webservers {
 		|| die "$DBI::errstr";;
 	my $stvu = $DBH->prepare('UPDATE vhost set ip = ? where vhost_id = ?')
 		|| die "$DBI::errstr";;
-	my $stvad = $DBH->prepare('DELETE from vhost_alias where vhost_id=?')
+	my $stva = $DBH->prepare('SELECT * from vhost_alias where vhost_id=?')
+		|| die "$DBI::errstr";;
+	my $stvad = $DBH->prepare('DELETE from vhost_alias where vhost_id=? and name=?')
 		|| die "$DBI::errstr";;
 	my $stud = $DBH->prepare('DELETE from vhost_url where vhost_id=?')
 		|| die "$DBI::errstr";;
@@ -767,15 +770,32 @@ sub collect_vhosts_from_webservers {
 
 		my $get_vhosts_cmd = "apachectl -t -D DUMP_VHOSTS";
 		print "Running `$get_vhosts_cmd`\n" if $VERBOSE;	
-		my $vhosts = sshopen2($host->{name}, *READER, *WRITER, $get_vhosts_cmd);
+		my $vhosts = sshopen3($host->{name}, *WRITER, *READER, *ERROR, $get_vhosts_cmd);
+
+		# Some hosts this is not going to run unless we specify the path
+		if (<ERROR> =~ /command not found/) {
+			$get_vhosts_cmd = '/usr/sbin/'. $get_vhosts_cmd;
+			print "Running `$get_vhosts_cmd`\n" if $VERBOSE;	
+			$vhosts = sshopen2($host->{name}, *READER, *WRITER, $get_vhosts_cmd);
+		}
+
+		# Some hosts this is not going to run well without elevated privileges
+		if (<READER> =~ /Action.*failed/) {
+			$get_vhosts_cmd = 'sudo '. $get_vhosts_cmd;
+			print "Running `$get_vhosts_cmd`\n" if $VERBOSE;	
+			$vhosts = sshopen2($host->{name}, *READER, *WRITER, $get_vhosts_cmd);
+		}
 
 		while (<READER>) {
 			my $vhost_line = $_;
-			next if ($vhost_line !~ /port (\d+) namevhost ([^\s]+) \(([^:]+):\d+\)/);
+			next if (
+				$vhost_line !~ /port (\d+) namevhost ([^\s]+) \(([^:]+):\d+\)/
+				&&
+				$vhost_line !~ /(?:[^:]+):(\d+) \s+ ([^\s]+) \(([^:]+):\d+\)/
+			);
 			my $port = $1;
 			my $vhost = $2;	
 			my $config = $3;
-			$vhosts{$vhost}{$port}{config} = $config;
 
 			# Get all of the aliases from the config file
 			my $cmd = $get_config_file_cmd . $config ."|grep -vi include";
@@ -788,7 +808,6 @@ sub collect_vhosts_from_webservers {
 
 			# TODO: some better error handling here may be in order
 			if (!$rc) {
-				print $acp->errstr ."\n";
 				exit;
 			}
 
@@ -797,19 +816,33 @@ sub collect_vhosts_from_webservers {
 			# (within that server).  Note, this is not a required directive, some
 			# vhost configs may still not include it!
 			my @aliases;
-			foreach my $sn ($acp->find_down_directive_names('servername')) {
-				my @server_comments = $acp->find_siblings_directive_names($sn, 'comment');
-				my @server_aliases = $acp->find_siblings_directive_names($sn, 'serveralias');
-				my @virtual_hosts = $acp->find_siblings_and_up_directive_names($sn, 'virtualhost');
-				my @document_roots = $acp->find_siblings_and_up_directive_names($sn, 'documentroot');
-				my $server_name  = $sn->value;
-				my $document_root = $document_roots[0]?$document_roots[0]->value:'';
-				my $virtual_host = $virtual_hosts[0]->value;
 
+			foreach my $apache_vhost ($acp->find_down_directive_names('virtualhost')) {
+				my @sn = $acp->find_down_directive_names($apache_vhost, 'servername');
+				my $sn = $sn[0];
+				my $server_name  = $sn->{value};
 				next if ($server_name ne $vhost);
 
-				# This code should prevent vhosts from ending up without an ip
+				# Some vhost configs do not have any server names
+				#next if ! ($sn && $sn->{value});
+				my $virtual_host = $apache_vhost->{value};
 				next if ($virtual_host !~ /([^:]+):$port/);
+
+				my @server_aliases  = $acp->find_down_directive_names($apache_vhost, 'serveralias');
+				my @document_roots  = $acp->find_down_directive_names($apache_vhost, 'documentroot');
+				my $document_root   = $document_roots[0]?$document_roots[0]->value:'';
+				my @ssl_engine      = $acp->find_down_directive_names($apache_vhost, 'sslengine');
+				my $ssl_engine      = $ssl_engine[0]?$ssl_engine[0]->value:'';
+
+
+				# For EE jails vhosts will be configured to proxy ssl connections 
+				# through NGINX.  We will see the ssl based vhosts configured to
+				# listen on port 444.  The following section of code will attempt
+				# to compensate for this
+				$port = 443 if ($port == 444 && $ssl_engine =~ /on/i);
+				$vhosts{$vhost}{$port}{config} = $config;
+
+				# This code should prevent vhosts from ending up without an ip
 				my $vhost_ip = $1;
 				$vhosts{$vhost}{$port}{ip} = $ip;
 				my $regexp = create_iprange_regexp(
@@ -841,15 +874,6 @@ sub collect_vhosts_from_webservers {
 					}
 				}
 
-				foreach my $comment (@server_comments) {
-					if (my ($url, $response, $qs) = $comment->value =~ /^monitor (\S+)(?:\s(\d+))?(?:\s(\S.*))?$/i) {
-						$qs = $qs?$qs:'';
-						$qs =~ s/^"//;
-						$qs =~ s/"$//;
-						$vhosts{$vhost}{$port}{urls}{$url}{'response'} = ($response =~ /\d{3}/) ? $response : 200;
-						$vhosts{$vhost}{$port}{urls}{$url}{'query_string'} = $qs ? $qs : '';
-					}
-				}
 			}
 
 			print "\tFound the aliases for $vhost:$port: ". join(', ', @aliases) ."...\n" if $VERBOSE;
@@ -857,10 +881,8 @@ sub collect_vhosts_from_webservers {
 		}
 
 		# We can't just delete the hosts because users may have added 
-		# query_strings for them that need to be persistent.  If there is
-		# a custom query_string or response added for a vhost, or vhost_alias
-		# and there is a 'monitor' comment in the vhost config, the 'monitor'
-		# entry will take precedence
+		# query_strings for them that need to be persistent.  
+
 		# Disable all vhosts that exist in the database that were not returned
 		$stv->execute($host->{host_id});
 		while (my $vhost = $stv->fetchrow_hashref()) {
@@ -877,13 +899,11 @@ sub collect_vhosts_from_webservers {
 				$stvu->execute($vhosts{$vhost->{name}}{$vhost->{port}}{ip}, $vhost->{vhost_id});
 			}
 
-			# We just remove the aliases and add the ones we found
-			print "\tRemoving aliases for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
-			$stvad->execute($vhost->{vhost_id});
-
-			foreach(@{$vhosts{$vhost->{name}}{$vhost->{port}}{aliases}}) {
-			  print "\tInserting ". $_ ." as alias for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;	
-				$stvai->execute($vhost->{vhost_id}, $_);
+			# Delete vhost_alias' associated with the vhost if they are no longer defined
+			$stva->execute($vhost->{vhost_id});
+			while (my $vhost_alias = $stva->fetchrow_hashref()) {
+				$stvad->execute($vhost->{vhost_id}, $vhost_alias->{name})
+					if(!grep($vhost_alias->{name}, @{$vhosts{$vhost->{name}}{$vhost->{port}}{aliases}}));
 			}
 
 			# We just remove the application types we found and then re-add them
@@ -902,33 +922,6 @@ sub collect_vhosts_from_webservers {
 				);
 			}
 
-			# We just remove the urls and add the ones we found
-			print "\tRemoving urls for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
-			$stud->execute($vhost->{vhost_id});
-
-			# If the url is actually a vhost or vhost_alias, update that instead of 
-			# adding a row in the urls table
-			foreach my $url (keys %{$vhosts{$vhost->{name}}{$vhost->{port}}{urls}}) {
-				$url =~ /([^\/]*)(\/.*)/;
-				my $name = $1 ? $1 : $vhost->{name};
-				my $path = $2;
-				my $response = $vhosts{$vhost->{name}}{$vhost->{port}}{urls}{$url}{response};
-				my $query_string = $vhosts{$vhost->{name}}{$vhost->{port}}{urls}{$url}{query_string};
-
-				print "\tInserting $url as url for ". $vhost->{name} .":". $vhost->{port} ."...\n" 
-					if $VERBOSE;
-
-				# Update the corresponding vhost row, then start over
-				$stvur->execute($response, $query_string, $name) && next
-					if (!$path && ($name eq $vhost->{name}));
-
-				# Update the corresponding vhost_alias row, then start over
-				$stvuvar->execute($response, $query_string, $name) && next
-					if (!$path && grep(/$name/, @{$vhosts{$vhost->{name}}{$vhost->{port}}{aliases}}));
-
-				# If there is a path, its a url
-				$stvui->execute($vhost->{vhost_id}, $name, $path, $response, $query_string);
-			}
 			delete($vhosts{$vhost->{name}}{$vhost->{port}});
 		}
 
@@ -943,7 +936,9 @@ sub collect_vhosts_from_webservers {
 
 				foreach (@{$vhosts{$vhost}{$port}{aliases}}) {
 					print "Adding $_ as alias for $vhost:$port...\n" if $VERBOSE;
-					$stvai->execute($rowid, $_);
+					# There is a UNIQUE key constraint on vhost_id and name, if we
+					# attempt to add a new row that already exists silently ignore
+					eval { $stvai->execute($rowid, $_); };
 				}
 				
 				print "\tInserting ". $vhosts{$vhost}{$port}{application} ." as application for ". $vhost .":". $port ."...\n" 
@@ -1103,10 +1098,14 @@ sub generate_nagios_config_files {
 		$stv->execute($host->{host_id});
 		my ($cluster, $wp_cluster, $drupal_cluster);
 		while (my $vhost = $stv->fetchrow_hashref()) {
+
+			# TODO: these definitions should not referrnce of nagios config node 
+			# types that are not defined here.  We cobbled in support for vhosts,
+			# web_application_updates, drupal_updates, wordpress_updates
 			print HOSTFILE "define service {\n".
 				"\tuse generic-service-passive-no-notification-no-perfdata\n".
 				"\tservice_description ". $vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
-				"\tservicegroups ". $host->{name} ."_vhosts\n".
+				"\tservicegroups ". $host->{name} ."_vhosts, vhosts\n".
 				"\thost_name $short_hostname\n}\n\n";
 
 			$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
@@ -1125,7 +1124,7 @@ sub generate_nagios_config_files {
 				print HOSTFILE "define service {\n".
 					"\tuse generic-service-passive-no-notification-no-perfdata\n".
 					"\tservice_description ". $vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
-					"\tservicegroups ". $host->{name} ."_aliases\n".
+					"\tservicegroups ". $host->{name} ."_aliases, vhosts\n".
 					"\thost_name $short_hostname\n}\n\n";
 
 				$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
@@ -1141,8 +1140,8 @@ sub generate_nagios_config_files {
 					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
 			}
 
-			# Generate the configs for the vhost urls found in the apache config
-			# comments.  Its possible there is no path
+			# Generate the configs for the vhost urls
+			# Its possible there is no path
 			$stvu->execute($vhost->{vhost_id});
 			while (my $vuhost = $stvu->fetchrow_hashref()) {
 				my $path = $vuhost->{path}?$vuhost->{path}:'';
@@ -1150,7 +1149,7 @@ sub generate_nagios_config_files {
 				print HOSTFILE "define service {\n".
 					"\tuse generic-service-passive-no-notification-no-perfdata\n".
 					"\tservice_description ". $vuhost->{name} .':'. $vhost->{port} . $path .' on '. $host->{name} ."\n".
-					"\tservicegroups ". $host->{name} ."_urls\n".
+					"\tservicegroups ". $host->{name} ."_urls, vhosts\n".
 					"\thost_name $short_hostname\n}\n\n";
 
 				$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
@@ -1173,7 +1172,9 @@ sub generate_nagios_config_files {
 					"\tuse generic-service-passive-no-notification-onceaday\n".
 					"\tservice_description ". $vhost->{name} .':'. $vhost->{port} .' on '. 
 						$host->{name} ." ". $vhostapp->{type} ." Updates\n".
-					"\tservicegroups ". $host->{name} ."_". lc($vhostapp->{type}) ."_updates\n".
+					"\tservicegroups ". $host->{name} ."_". lc($vhostapp->{type}) .
+					"_updates, web_application_updates, ".
+					lc($vhostapp->{type}) ."_updates\n".
 					"\thost_name $short_hostname\n}\n\n";
 
 				if ($vhostapp->{type} =~ /Drupal/) {
@@ -1262,7 +1263,7 @@ sub run_checks_as_daemon {
 	$LOGGER->add_appender($appender);
 	$LOGGER->level($INFO);
 	#$LOGGER->level($WARN);
-	#$LOGGER->level($DEBUG);
+  #$LOGGER->level($DEBUG);
 	$LOGGER->debug('Logger initialized');
 
 	my @servers;
@@ -1388,6 +1389,8 @@ sub process_server_vhosts {
 		"WHERE vhost_id = ?")
 		|| die "$DBI::errstr";
 
+	$LOGGER->debug("process_server_vhosts($host_id, $hostname)\n");
+
 	while (1) {
 		my $start = time();
 		# start processing vhosts and aliases
@@ -1435,6 +1438,8 @@ sub process_server_vhosts {
 					usleep($sleep);
 				} 
 
+				my $query_string = $vhost_alias->{query_string} ? $vhost_alias->{query_string} : $vhost->{query_string};
+				my $response = $vhost_alias->{response} ? $vhost_alias->{response} : $vhost->{response};
 				if ($threads>1) {
 					if (scalar(keys %children) == $threads) {
 						$LOGGER->debug('Already have '. scalar(keys %children) .' processes for this loop, waiting for one to return');
@@ -1451,12 +1456,10 @@ sub process_server_vhosts {
 						$children{$pid} = 1;
 					} else {
 						check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
-							$vhost->{query_string}, $hostname, $vhost->{response});
+							$query_string, $hostname, $response);
 						exit 0;
 					}
 				} else {
-					my $query_string = $vhost_alias->{query_string} ? $vhost_alias->{query_string} : $vhost->{query_string};
-					my $response = $vhost_alias->{response} ? $vhost_alias->{response} : $vhost->{response};
 					check_host($vhost_alias->{name}, $vhost->{ip}, $vhost->{port}, 
 						$query_string, $hostname, $response);
 				}
@@ -1470,6 +1473,8 @@ sub process_server_vhosts {
 					usleep($sleep);
 				} 
 
+				my $query_string = $vhost_url->{query_string} ? $vhost_url->{query_string} : $vhost->{query_string};
+				my $response = $vhost_url->{response} ? $vhost_url->{response} : $vhost->{response};
 				if ($threads>1) {
 					if (scalar(keys %children) == $threads) {
 						$LOGGER->debug('Already have '. scalar(keys %children) .' processes for this loop, waiting for one to return');
@@ -1505,6 +1510,7 @@ sub process_server_vhosts {
 			$LOGGER->debug('All forked processes for the '. $hostname .' process loop have been accounted for');
 		}
 
+		# TODO: FIXME if $num_vhosts is 0 then there will be an issue below
 		my $end = time();
 		$total_time = $end-$start;
 		$LOGGER->debug($hostname .' loop took '. $total_time .' seconds');
@@ -1697,6 +1703,7 @@ sub get_and_send_web_application_status_to_nagios {
 		LEFT JOIN vhost ON (host.host_id = vhost.host_id)
 		LEFT JOIN vhost_application ON ( vhost.vhost_id = vhost_application.vhost_id)
 		WHERE vhost_application.type=?
+		AND host.nagios_host_name="harm"
 	');
 
 	$sth->execute('Drupal');
@@ -1711,7 +1718,7 @@ sub get_and_send_web_application_status_to_nagios {
 			# RETURN CODES:
 			# 0-OK, 1-WARNING, 2-CRITICAL, 3-UNKNOWN
 			open(NSCA, "|$NSCA -H $NSCA_HOST -c $NSCA_CONFIG") or 
-				die "could not start nsca: $NSCA -H $NSCA_HOST -c $NSCA_CONFIG"
+				die "could not start nsca: $NSCA -H $NSCA_HOST -c $NSCA_CONFIG";
 
 			my $rc = 0;
 			$rc = 1 if $line =~ /WARNING/;
