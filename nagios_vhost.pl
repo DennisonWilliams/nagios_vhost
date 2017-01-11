@@ -1044,7 +1044,7 @@ sub add_vhost_query_string {
 
 sub generate_nagios_config_files {
 	my ($hosts) = @_;
-	my $sth = $DBH->prepare("SELECT host_id,name from host")
+	my $sth = $DBH->prepare("SELECT host_id,name,nagios_host_name from host")
 		|| die "$DBI::errstr";
 
 	my $stv = $DBH->prepare(
@@ -1106,15 +1106,15 @@ sub generate_nagios_config_files {
 				"\tuse generic-service-passive-no-notification-no-perfdata\n".
 				"\tservice_description ". $vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 				"\tservicegroups ". $host->{name} ."_vhosts, vhosts\n".
-				"\thost_name $short_hostname\n}\n\n";
+				"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
 
 			$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
 				$vhost->{name} .':'.  $vhost->{port} .' on '. $host->{name} .'$,';
 
 			print HOSTFILE "define servicedependency {\n".
-				"\thost_name $short_hostname\n".
+				"\thost_name ". $host->{nagios_host_name} ."\n".
 				"\tservice_description HTTP\n".
-				"\tdependent_host_name $short_hostname\n".
+				"\tdependent_host_name ". $host->{nagios_host_name} ."\n".
 				"\tdependent_service_description ". $vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 				"\texecution_failure_criteria n\n".
 				"\tnotification_failure_criteria w,u,c,p\n}\n\n";
@@ -1125,16 +1125,16 @@ sub generate_nagios_config_files {
 					"\tuse generic-service-passive-no-notification-no-perfdata\n".
 					"\tservice_description ". $vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 					"\tservicegroups ". $host->{name} ."_aliases, vhosts\n".
-					"\thost_name $short_hostname\n}\n\n";
+					"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
 
 				$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
 					$vahost->{name} .':'. 
 					$vhost->{port} .' on '. $host->{name} .'$,';
 
 				print HOSTFILE "define servicedependency {\n".
-					"\thost_name $short_hostname\n".
+					"\thost_name ". $host->{nagios_host_name} ."\n".
 					"\tservice_description HTTP\n".
-					"\tdependent_host_name $short_hostname\n".
+					"\tdependent_host_name ". $host->{nagios_host_name} ."\n".
 					"\tdependent_service_description ". $vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 					"\texecution_failure_criteria n\n".
 					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
@@ -1150,16 +1150,16 @@ sub generate_nagios_config_files {
 					"\tuse generic-service-passive-no-notification-no-perfdata\n".
 					"\tservice_description ". $vuhost->{name} .':'. $vhost->{port} . $path .' on '. $host->{name} ."\n".
 					"\tservicegroups ". $host->{name} ."_urls, vhosts\n".
-					"\thost_name $short_hostname\n}\n\n";
+					"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
 
 				$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
 					$vuhost->{name} .':'. $vhost->{port} . $path .' on '. 
 					$host->{name} .'$,';
 
 				print HOSTFILE "define servicedependency {\n".
-					"\thost_name $short_hostname\n".
+					"\thost_name ". $host->{nagios_host_name} ."\n".
 					"\tservice_description HTTP\n".
-					"\tdependent_host_name $short_hostname\n".
+					"\tdependent_host_name ". $host->{nagios_host_name} ."\n".
 					"\tdependent_service_description ". $vuhost->{name} .':'. $vhost->{port} . $path .' on '. $host->{name} ."\n".
 					"\texecution_failure_criteria n\n".
 					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
@@ -1175,7 +1175,7 @@ sub generate_nagios_config_files {
 					"\tservicegroups ". $host->{name} ."_". lc($vhostapp->{type}) .
 					"_updates, web_application_updates, ".
 					lc($vhostapp->{type}) ."_updates\n".
-					"\thost_name $short_hostname\n}\n\n";
+					"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
 
 				if ($vhostapp->{type} =~ /Drupal/) {
 					$drupal_cluster .= ',' if $drupal_cluster;
@@ -1190,9 +1190,9 @@ sub generate_nagios_config_files {
         }
 
 				print HOSTFILE "define servicedependency {\n".
-					"\thost_name $short_hostname\n".
+					"\thost_name ". $host->{nagios_host_name} ."\n".
 					"\tservice_description ". $vhostapp->{type} ." Updates\n".
-					"\tdependent_host_name $short_hostname\n".
+					"\tdependent_host_name ". $host->{nagios_host_name}. "\n".
 					"\tdependent_service_description ". $vhost->{name} .':'. $vhost->{port} .
 						' on '. $host->{name} ." ". $vhostapp->{type} ." Updates\n".
 					"\texecution_failure_criteria n\n".
@@ -1223,20 +1223,20 @@ sub generate_nagios_config_files {
 		print HOSTFILE "define service{\n".
 			"\tuse generic-service\n".
 			"\tservice_description HTTP Vhosts\n".
-			"\thost_name $short_hostname\n".
+			"\thost_name ". $host->{nagios_host_name} ."\n".
 			"\tcheck_command check_service_cluster!\"HTTP Vhosts\"!0!1!$cluster\n}\n\n";
 
 		print HOSTFILE "define service{\n".
 			"\tuse generic-service\n".
 			"\tservice_description Drupal Updates\n".
-			"\thost_name $short_hostname\n".
+			"\thost_name ". $host->{nagios_host_name} ."\n".
 			"\tcheck_command check_service_cluster!\"Drupal Updates\"!0!1!$drupal_cluster\n}\n\n"
 			if $drupal_cluster;
 
 		print HOSTFILE "define service{\n".
 			"\tuse generic-service\n".
 			"\tservice_description WordPress Updates\n".
-			"\thost_name $short_hostname\n".
+			"\thost_name ". $host->{nagios_host_name} ."\n".
 			"\tcheck_command check_service_cluster!\"Wordpress Updates\"!0!1!$wp_cluster\n}\n\n"
 			if $wp_cluster;
 
