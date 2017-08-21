@@ -344,7 +344,7 @@ our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
 our ($UPDATEWEBSERVERS, $LOCATION, $WEBAPPLICATIONSTATUSTONAGIOS);
-our ($DATABASE, $USERNAME, $PASSWORD);
+our ($DATABASE, $USERNAME, $PASSWORD, $WEBAPPLICATION);
 
 # The following globals are used to send web application update status to nsca
 our ($NSCA, $NSCA_HOST, $NSCA_CONFIG);
@@ -377,6 +377,7 @@ my $result = GetOptions (
 	"add-vhost-query-string:s"         => \$ADDVHOSTQUERYSTRING,
 	"nagios-config-dir:s"              => \$NAGIOSCONFIGDIR,
 	"update-web-servers:s"             => \$UPDATEWEBSERVERS,
+	"web-application"                  => \$WEBAPPLICATION,
 	"web-application-status-to-nagios" => \$WEBAPPLICATIONSTATUSTONAGIOS,
 	"daemon"                           => \$DAEMON,
 	"use-nsca"                         => \$USENSCA,
@@ -863,8 +864,11 @@ sub collect_vhosts_from_webservers {
 				$vhosts{$vhost}{$port}{name} = $vhost;
 				# Record where the documentroot is
 				$vhosts{$vhost}{$port}{documentroot} = $document_root;
+
 				# Log back into the server and attempt to determine the application type
-				$vhosts{$vhost}{$port}{application} = check_vhost_application_type($host->{name}, $vhosts{$vhost}{$port}{documentroot});
+				$vhosts{$vhost}{$port}{application} = 
+          check_vhost_application_type($host->{name}, $vhosts{$vhost}{$port}{documentroot})
+					if ($WEBAPPLICATION);
 
 				foreach my $sa (@server_aliases) {
 					my $sav = $sa->value;
@@ -907,12 +911,14 @@ sub collect_vhosts_from_webservers {
 			}
 
 			# We just remove the application types we found and then re-add them
-			print "\tRemoving vhost_application rows for ". $vhost->{name} .":". $vhost->{port} ."...\n" if $VERBOSE;
-			$stvapd->execute($vhost->{vhost_id});
+			print "\tRemoving vhost_application rows for ". $vhost->{name} .":". $vhost->{port} ."...\n" 
+        if ($VERBOSE && $WEBAPPLICATION);
+			$stvapd->execute($vhost->{vhost_id})
+        if ($VERBOSE && $WEBAPPLICATION);
 
 			print "\tInserting ". $vhosts{$vhost->{name}}{$vhost->{port}}{application} .
 				" as application for ". $vhost->{name} .":". $vhost->{port} ."...\n" 
-				if $VERBOSE && $vhosts{$vhost->{name}}{$vhost->{port}}{application};	
+				if $VERBOSE && $vhosts{$vhost->{name}}{$vhost->{port}}{application} && $WEBAPPLICATION;
 
 			if ($vhosts{$vhost->{name}}{$vhost->{port}}{application}) {
 				$stvapi->execute(
@@ -1285,8 +1291,8 @@ sub run_checks_as_daemon {
 
 	# Loop across all of the vhosts and alias' in the database and submit 
 	# Passive checks for them
-	my $sth = $DBH->prepare("SELECT host_id,name from host")
-		|| die "$DBI::errstr";
+	my $sth = $DBH->prepare("SELECT host_id,name from host") 
+          || die "$DBI::errstr";
 
 	eval {
 		$sth->execute();
@@ -1337,6 +1343,9 @@ sub response_redirect {
 	my($response, $ua, $h) = @_;
 
 	my $url;
+	$LOGGER->warn("response_redirect location header: ". $response->header('Location'));
+	$LOGGER->warn("response_redirect LOCATION: $LOCATION");
+	
 	if ($response->header('Location')) {
 
 		# This is an ugly fix, but to help keep us from ending up in the 
@@ -1609,6 +1618,9 @@ sub check_host {
 
 	# TODO: is this a problem with the special characters in a url?
 	if ($LOCATION ne 'matched' && $rc =~ /3\d\d/ ) {
+		$LOGGER->warn("\$NO302 query_string: $query_string");
+		$LOGGER->warn("\$NO302 LOCATION: $LOCATION");
+		$LOGGER->warn("\$NO302 rc: $rc");
     $LOGGER->warn("NO302: ${http}://${ip}${path} (HOST => $name): $LOCATION");
 		$response .= " Did NOT $rc to expected location: $query_string";
 		$code=2;
