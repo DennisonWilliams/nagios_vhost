@@ -343,7 +343,7 @@ package main;
 our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
-our ($UPDATEWEBSERVERS, $LOCATION, $WEBAPPLICATIONSTATUSTONAGIOS);
+our ($UPDATEWEBSERVERS, $LOCATION, $WEBAPPLICATIONSTATUS);
 our ($DATABASE, $USERNAME, $PASSWORD, $WEBAPPLICATION);
 
 # The following globals are used to send web application update status to nsca
@@ -378,7 +378,8 @@ my $result = GetOptions (
 	"nagios-config-dir:s"              => \$NAGIOSCONFIGDIR,
 	"update-web-servers:s"             => \$UPDATEWEBSERVERS,
 	"web-application"                  => \$WEBAPPLICATION,
-	"web-application-status-to-nagios" => \$WEBAPPLICATIONSTATUSTONAGIOS,
+	"webapplication"                   => \$WEBAPPLICATION,
+	"web-application-status" => \$WEBAPPLICATIONSTATUS,
 	"daemon"                           => \$DAEMON,
 	"use-nsca"                         => \$USENSCA,
 	"external-command-file:s"          => \$CMD_FILE,
@@ -413,8 +414,8 @@ if ($ADDWEBSERVER) {
 } elsif (defined($UPDATEWEBSERVERS)) {
 	collect_vhosts_from_webservers($UPDATEWEBSERVERS);
 	generate_nagios_config_files($UPDATEWEBSERVERS);
-} elsif (defined $WEBAPPLICATIONSTATUSTONAGIOS) {
-	get_and_send_web_application_status_to_nagios();
+} elsif (defined $WEBAPPLICATIONSTATUS) {
+	get_web_application_status();
 } else {
 	usage();
 }
@@ -700,7 +701,9 @@ sub collect_vhosts_from_webservers {
 	my $sth = $DBH->prepare('SELECT host_id,name from host')
 		|| die "$DBI::errstr";;
 	my $stv = $DBH->prepare('
-		SELECT * from vhost 
+		SELECT vhost.host_id, vhost.vhost_id as vhost_id, vhost.last_checked, vhost.name as name, 
+		vhost.ip as ip, vhost.port as port, vhost.response, vhost.query_string, 
+		vhost_application.type, vhost_application.path from vhost 
 		LEFT JOIN vhost_application on (vhost.vhost_id = vhost_application.vhost_id)
 		WHERE host_id=?
 	') || die "$DBI::errstr";;
@@ -824,6 +827,9 @@ sub collect_vhosts_from_webservers {
 				my $server_name  = $sn->{value};
 				next if ($server_name ne $vhost);
 
+        # This is a one off to ignore EE internal vhosts
+				next if ($server_name =~ /electricembers\.net/);
+
 				# Some vhost configs do not have any server names
 				#next if ! ($sn && $sn->{value});
 				my $virtual_host = $apache_vhost->{value};
@@ -865,6 +871,7 @@ sub collect_vhosts_from_webservers {
 				# Record where the documentroot is
 				$vhosts{$vhost}{$port}{documentroot} = $document_root;
 
+				print "\tGetting the web application for $vhost:$port ...\n" if $VERBOSE;
 				# Log back into the server and attempt to determine the application type
 				$vhosts{$vhost}{$port}{application} = 
           check_vhost_application_type($host->{name}, $vhosts{$vhost}{$port}{documentroot})
@@ -936,6 +943,10 @@ sub collect_vhosts_from_webservers {
 			my $vhost = $_;
 			foreach (keys %{$vhosts{$vhost}}) {
 				my $port = $_;
+
+        # This is a one off to ignore EE internal vhosts
+				next if ($vhost =~ /electricembers\.net/);
+
 				print "Adding new vhost: $vhost:$port (". $host->{host_id} .")...\n" if $VERBOSE;
 				$stvi->execute($host->{host_id}, $vhost, $port, $vhosts{$vhost}{$port}{ip});
 				my $rowid = $stvi->{mysql_insertid};
@@ -1269,8 +1280,8 @@ sub run_checks_as_daemon {
 	$LOGGER->add_appender($appender);
 	$LOGGER->level($INFO);
 	#$LOGGER->level($WARN);
-  #$LOGGER->level($DEBUG);
-	#$LOGGER->debug('Logger initialized');
+  $LOGGER->level($DEBUG);
+	$LOGGER->debug('Logger initialized');
 
 	my $servers;
 	my $TERMD = 0;
@@ -1714,6 +1725,74 @@ sub print_statistics {
 	}
 	
 	$LOGGER->level($level);
+}
+
+# get all hosts associated with Drupal, log in and check for module updates
+sub get_web_application_status{
+
+	my $check_drupal_cmd = "check_drupal.pl -p ";
+	my $check_wordpress_cmd = "check_wordpress.pl -p ";
+	
+	my $sth = $DBH->prepare(
+	'SELECT host.name as hostname, host.nagios_host_name as nagios_hostname,
+		vhost.name as vhostname, vhost.port as port,
+		vhost_application.path as path, vhost_application.type as type
+		FROM host
+		LEFT JOIN vhost ON (host.host_id = vhost.host_id)
+		LEFT JOIN vhost_application ON ( vhost.vhost_id = vhost_application.vhost_id)
+		WHERE vhost_application.type=?
+	');
+
+	$sth->execute('Drupal');
+	while (my $result = $sth->fetchrow_hashref()) {
+		print "\t". $result->{hostname} ."\$ $check_drupal_cmd ".
+			$result->{path} ." --uri=". $result->{vhostname} ."\n"
+			if $VERBOSE;
+
+		my $vhosts = sshopen2($result->{hostname}, *READER5, *WRITER5, 
+			$check_drupal_cmd . $result->{path} ." --uri=". $result->{vhostname});
+		while (my $line = <READER5>) {
+			# RETURN CODES:
+			# 0-OK, 1-WARNING, 2-CRITICAL, 3-UNKNOWN
+			my $rc = 0;
+			$rc = 1 if $line =~ /WARNING/;
+			$rc = 2 if $line =~ /CRITICAL/;
+			$rc = 3 if $line =~ /UNKNOWN/;
+
+			print "\t". $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
+				$result->{port} .' on '. $result->{hostname} ." ". $result->{type} .
+				" Updates\t$rc\t$line"
+				if $VERBOSE>1;
+
+		}
+	}
+	close READER5;
+	close WRITER5;
+
+	$sth->execute('WordPress');
+	while (my $result = $sth->fetchrow_hashref()) {
+
+		print "\t". $result->{hostname} ."\$ $check_wordpress_cmd". 
+			$result->{path} ."\n"
+			if $VERBOSE;
+
+		sshopen2($result->{hostname}, *READER6, *WRITER6, $check_wordpress_cmd .$result->{path});
+		while (my $line = <READER6>) {
+
+			# RETURN CODES:
+			# 0-OK, 1-WARNING, 2-CRITICAL, 3-UNKNOWN
+			my $rc = 0;
+			$rc = 2 if $line =~ /CRITICAL/;
+
+			print "\t". $result->{nagios_hostname} ."\t". $result->{vhostname} .':'. 
+				$result->{port} .' on '. $result->{hostname} ." ". $result->{type} .
+				" Updates\t$rc\t$line"
+				if $VERBOSE>1;
+
+		}
+	}
+	close READER6;
+	close WRITER6;
 }
 
 # get all hosts associated with Drupal, log in and check for module updates
