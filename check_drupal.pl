@@ -37,7 +37,6 @@ my $json = JSON->new;
 $json->relaxed([1]);
 
 my $path = $np->opts->path?$np->opts->path:`pwd`;
-chomp $path;
 print "running $drush -r $path ups\n"
 		if $np->opts->verbose;
 
@@ -56,10 +55,7 @@ while (my $line = <DRUSH>) {
 close DRUSH;
 
 if ( $jsonText =~ /needs a higher bootstrap/) {
-  # FreeBSD does not have cuserid
-  my $user = `id`;
-  chomp $user;
-  eval { $user = POSIX::cuserid(); };
+  my $user = POSIX::cuserid();
   $np->nagios_exit(UNKNOWN, "Could not run: $drush. Check that $user has permissions to settings.php.");
 }
 
@@ -73,7 +69,7 @@ $np->nagios_exit(OK, "") if ! $jsonText2;
 
 my $jsonO = $json->decode($jsonText2);
 
-foreach my $module (keys %$jsonO) {
+foreach my $module (keys %{$jsonO}) {
 	my $installed = $jsonO->{$module}->{'existing_version'};
 	my $proposed = $jsonO->{$module}->{'recommended'};
 	my $message = $jsonO->{$module}->{status_msg};
