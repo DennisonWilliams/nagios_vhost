@@ -81,9 +81,10 @@ goto CHECKPLUGINS if !$jsonText;
 my $jsonO = $json->decode($jsonText);
 my $core_updates;
 my $severity = OK;
-foreach my $index (keys %{$jsonO}) {
+
+foreach my $index (@{$jsonO}) {
         $core_updates .=', ' if $core_updates;
-        $core_updates .= $jsonO->[$index]->{version};
+        $core_updates .= $index->{'version'};
 }
 $np->add_message(CRITICAL, "Core ". $installed_core ." < (". $core_updates .") ")
   if $core_updates;
@@ -112,10 +113,10 @@ if ($jsonText =~ /Fatal error/) {
 goto EXIT if !$jsonText;
 
 $jsonO = $json->decode($jsonText);
-foreach my $index (keys $jsonO) {
-        my $plugin_updates .= $jsonO->[$index]->{name} .' ('.
-          $jsonO->[$index]->{version} .' < '.
-          $jsonO->[$index]->{update_version} .' )';
+foreach my $index (@{$jsonO}) {
+        my $plugin_updates .= $index->{name} .' ('.
+          $index->{version} .' < '.
+          $index->{update_version} .' )';
         $np->add_message(CRITICAL, $plugin_updates);
 }
 
