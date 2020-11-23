@@ -1116,7 +1116,7 @@ sub generate_nagios_config_files {
 		open (HOSTFILE, '>', $NAGIOSCONFIGDIR . $host->{name} .'_vhosts.cfg')
 			|| die('Could not open the vhost config file ('. $NAGIOSCONFIGDIR . $host->{name} .'_vhosts.cfg' .'): '. $?);
 		$stv->execute($host->{host_id});
-		my ($cluster, $wp_cluster, $drupal_cluster);
+		my ($wp_cluster, $drupal_cluster);
 		while (my $vhost = $stv->fetchrow_hashref()) {
 
 			# TODO: these definitions should not referrnce of nagios config node 
@@ -1127,9 +1127,6 @@ sub generate_nagios_config_files {
 				"\tservice_description ". $vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 				"\tservicegroups ". $host->{name} ."_vhosts, vhosts\n".
 				"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
-
-			$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
-				$vhost->{name} .':'.  $vhost->{port} .' on '. $host->{name} .'$,';
 
 			print HOSTFILE "define servicedependency {\n".
 				"\thost_name ". $host->{nagios_host_name} ."\n".
@@ -1146,10 +1143,6 @@ sub generate_nagios_config_files {
 					"\tservice_description ". $vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 					"\tservicegroups ". $host->{name} ."_aliases, vhosts\n".
 					"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
-
-				$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
-					$vahost->{name} .':'. 
-					$vhost->{port} .' on '. $host->{name} .'$,';
 
 				print HOSTFILE "define servicedependency {\n".
 					"\thost_name ". $host->{nagios_host_name} ."\n".
@@ -1171,10 +1164,6 @@ sub generate_nagios_config_files {
 					"\tservice_description ". $vuhost->{name} .':'. $vhost->{port} . $path .' on '. $host->{name} ."\n".
 					"\tservicegroups ". $host->{name} ."_urls, vhosts\n".
 					"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
-
-				$cluster .= '$SERVICESTATEID:'. $short_hostname .':'. 
-					$vuhost->{name} .':'. $vhost->{port} . $path .' on '. 
-					$host->{name} .'$,';
 
 				print HOSTFILE "define servicedependency {\n".
 					"\thost_name ". $host->{nagios_host_name} ."\n".
@@ -1220,14 +1209,6 @@ sub generate_nagios_config_files {
 			}
 		}
 
-#		print HOSTFILE "define servicedependency {\n".
-#			"\thost_name $short_hostname\n".
-#			"\tservice_description HTTP\n".
-#			"\tdependent_host_name $short_hostname\n".
-#			"\tdependent_service_description ^.* on huang.radicaldesigns.org\$\n".
-#			"\texecution_failure_criteria n\n".
-#			"\tnotification_failure_criteria w,u,c,p\n}\n\n";
-
 		print HOSTFILE "define servicegroup {\n".
 			"\tservicegroup_name ". $host->{name} ."_vhosts\n}\n\n";
 		print HOSTFILE "define servicegroup {\n".
@@ -1239,12 +1220,13 @@ sub generate_nagios_config_files {
 		print HOSTFILE "define servicegroup {\n".
 			"\tservicegroup_name ". $host->{name} ."_wordpress_updates\n}\n\n";
 
-		$cluster =~ s/,$//;
+		# We use an On-Demand Group Macro here	
+		# https://assets.nagios.com/downloads/nagioscore/docs/nagioscore/4/en/macros.html
 		print HOSTFILE "define service{\n".
 			"\tuse generic-service\n".
 			"\tservice_description HTTP Vhosts\n".
 			"\thost_name ". $host->{nagios_host_name} ."\n".
-			"\tcheck_command check_service_cluster!\"HTTP Vhosts\"!0!1!$cluster\n}\n\n";
+			"\tcheck_command check_service_cluster!\"HTTP Vhosts\"!0!1!\$SERVICESTATEID:". $host->{name} ."_vhosts:,\$\n}\n\n";
 
 		print HOSTFILE "define service{\n".
 			"\tuse generic-service\n".
