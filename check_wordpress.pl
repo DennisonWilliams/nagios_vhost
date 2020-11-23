@@ -69,23 +69,22 @@ close WP;
 # If $jsonText2 is empty it could also be because there are not updates
 # TODO: Verify this is not needed
 # if ($jsonText =~ m/Fatal error/s) { 
-if ($jsonText && $jsonText =~ /Fatal error/) {
+if ($jsonText =~ /Fatal error/) {
   $np->add_message(CRITICAL, "Running '$wp_check_core_update' returned an error.");
   $jsonText = '';
-} elsif ( $jsonText && $jsonText =~ m/([^\[]*)([\[].*)$/s ) {
+} elsif ( $jsonText =~ m/([^\[]*)([\[].*)$/s ) {
 	# Its possible there is a bunch of warning messages at the begining
 	$jsonText = $2;
 }
 goto CHECKPLUGINS if !$jsonText;
 
-my $updates = $json->decode($jsonText);
+my $jsonO = $json->decode($jsonText);
 my $core_updates;
 my $severity = OK;
-#print Dumper($jsonText);
-#print Dumper($updates); exit;
-foreach my $update (keys @$updates) {
+
+foreach my $index (@{$jsonO}) {
         $core_updates .=', ' if $core_updates;
-        $core_updates .= $update->{version}?$update->{version}:'';
+        $core_updates .= $index->{'version'};
 }
 $np->add_message(CRITICAL, "Core ". $installed_core ." < (". $core_updates .") ")
   if $core_updates;
@@ -111,13 +110,13 @@ if ($jsonText =~ /Fatal error/) {
 	# Its possible there is a bunch of warning messages at the begining
 	$jsonText = $2;
 }
-goto EXIT if !$jsonText || $jsonText =~ /No plugin updates available/;
+goto EXIT if !$jsonText;
 
 $jsonO = $json->decode($jsonText);
-foreach my $update (@$jsonO) {
-        my $plugin_updates .= $update->{name} .' ('.
-          $update->{version} .' < '.
-          $update->{update_version} .' )';
+foreach my $index (@{$jsonO}) {
+        my $plugin_updates .= $index->{name} .' ('.
+          $index->{version} .' < '.
+          $index->{update_version} .' )';
         $np->add_message(CRITICAL, $plugin_updates);
 }
 
