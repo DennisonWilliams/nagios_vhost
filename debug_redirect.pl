@@ -19,6 +19,7 @@ if (!$VHOST) {
 
 my $mech = WWW::Mechanize->new(
 	ssl_opts => { 
+		SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE,
 		verify_hostname => 0
 	} 
 );

@@ -344,13 +344,13 @@ our ($VERBOSE, $ADDWEBSERVER, $QUERYSTRING, $ADDVHOSTQUERYSTRING, $DBFILE);
 our ($DBH, $NAGIOSCONFIGDIR, $GETWEBSERVERS, $DAEMON, $USENSCA, $CMD_FILE);
 our ($MAXTURNAROUNDTIME, $MAXTHREADSPERHOST, $LOGGER, $CONTINUE);
 our ($UPDATEWEBSERVERS, $LOCATION, $WEBAPPLICATIONSTATUSTONAGIOS);
-our ($DATABASE, $USERNAME, $PASSWORD);
+our ($DATABASE, $USERNAME, $PASSWORD, $DATABASESERVER, $CODE);
 
 # The following globals are used to send web application update status to nsca
 our ($NSCA, $NSCA_HOST, $NSCA_CONFIG);
-$NSCA="/usr/sbin/send_nsca";
+$NSCA="/opt/omd/versions/1.20/bin/send_nsca";
 $NSCA_HOST = 'localhost';
-$NSCA_CONFIG = '/etc/send_nsca.cfg';
+$NSCA_CONFIG = '/opt/omd/sites/nagvis/etc/send_nsca.cfg';
 
 # The max amount of time that can pass between checking vhosts in seconds
 $MAXTURNAROUNDTIME = 10*60;
@@ -366,8 +366,10 @@ $USENSCA = 0;
 $CMD_FILE = '/var/lib/nagios3/rw/nagios.cmd';
 
 $DATABASE = 'nagios_vhost';
+$DATABASESERVER = '127.0.0.1';
 $USERNAME = 'nagios_vhost';
 $PASSWORD = 'nagios_vhost';
+
 my $help;
 
 my $result = GetOptions (
@@ -384,6 +386,7 @@ my $result = GetOptions (
 	"nsca-host:s"                      => \$NSCA_HOST,
 	"nsca-config:s"                    => \$NSCA_CONFIG,
 	"database:s"                       => \$DATABASE,
+	"database-server:s"                       => \$DATABASESERVER,
 	"username:s"                       => \$USERNAME,
 	"password:s"                       => \$PASSWORD,
 	"verbose+"                         => \$VERBOSE,
@@ -410,7 +413,7 @@ if ($ADDWEBSERVER) {
 		if (!defined($QUERYSTRING));
 	add_vhost_query_string();
 } elsif (defined($UPDATEWEBSERVERS)) {
-	collect_vhosts_from_webservers($UPDATEWEBSERVERS);
+	#collect_vhosts_from_webservers($UPDATEWEBSERVERS);
 	generate_nagios_config_files($UPDATEWEBSERVERS);
 } elsif (defined $WEBAPPLICATIONSTATUSTONAGIOS) {
 	get_and_send_web_application_status_to_nagios();
@@ -431,7 +434,7 @@ sub initDB{
 		if $VERBOSE;	
 
 	# Connect to the database
-	my $dsn = "DBI:mysql:database=$DATABASE";
+	my $dsn = "DBI:mysql:database=$DATABASE;host=$DATABASESERVER";
 	$DBH = DBI->connect($dsn, $USERNAME, $PASSWORD,{ 
 		RaiseError => 1,
 		mysql_auto_reconnect => 1,
@@ -978,6 +981,7 @@ sub check_vhost_application_type {
 }
 
 sub generate_check_vhost_config_files {
+	print "generate_check_vhost_config_files()\n";
 	my $sth = $DBH->prepare("SELECT host_id,name from host")
 		|| die "$DBI::errstr";
 
@@ -1069,7 +1073,7 @@ sub generate_nagios_config_files {
 
 	# If we are passed in a host list, then process it
 	if ($hosts ne '') {
-		my $query = 'SELECT host_id,name from host where ';
+		my $query = 'SELECT host_id,name,nagios_host_name from host where ';
 		my $first = 1;
 		my @hosts;
 		foreach (split /,/, $hosts) {
@@ -1088,7 +1092,6 @@ sub generate_nagios_config_files {
 	}
 
 	while (my $host = $sth->fetchrow_hashref()) {
-		# TODO: do this
 		$host->{name} =~ /^([^\.]+)/;
 		my $short_hostname = $1;
 		print "Creating vhost config file for ". $host->{name} ."(". $NAGIOSCONFIGDIR . $host->{name} ."_vhosts.cfg...\n" 
@@ -1103,7 +1106,7 @@ sub generate_nagios_config_files {
 			# types that are not defined here.  We cobbled in support for vhosts,
 			# web_application_updates, drupal_updates, wordpress_updates
 			print HOSTFILE "define service {\n".
-				"\tuse generic-service-passive-no-notification-no-perfdata\n".
+				"\tuse generic-service-passive\n".
 				"\tservice_description ". $vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 				"\tservicegroups ". $host->{name} ."_vhosts, vhosts\n".
 				"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
@@ -1122,7 +1125,7 @@ sub generate_nagios_config_files {
 			$stva->execute($vhost->{vhost_id});
 			while (my $vahost = $stva->fetchrow_hashref()) {
 				print HOSTFILE "define service {\n".
-					"\tuse generic-service-passive-no-notification-no-perfdata\n".
+					"\tuse generic-service-passive\n".
 					"\tservice_description ". $vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 					"\tservicegroups ". $host->{name} ."_aliases, vhosts\n".
 					"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
@@ -1147,7 +1150,7 @@ sub generate_nagios_config_files {
 				my $path = $vuhost->{path}?$vuhost->{path}:'';
 
 				print HOSTFILE "define service {\n".
-					"\tuse generic-service-passive-no-notification-no-perfdata\n".
+					"\tuse generic-service-passive\n".
 					"\tservice_description ". $vuhost->{name} .':'. $vhost->{port} . $path .' on '. $host->{name} ."\n".
 					"\tservicegroups ". $host->{name} ."_urls, vhosts\n".
 					"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
@@ -1169,7 +1172,7 @@ sub generate_nagios_config_files {
 			$stvas->execute($vhost->{vhost_id});
 			while (my $vhostapp = $stvas->fetchrow_hashref()) {
 				print HOSTFILE "define service {\n".
-					"\tuse generic-service-passive-no-notification-onceaday\n".
+					"\tuse generic-service-passive-onceaday\n".
 					"\tservice_description ". $vhost->{name} .':'. $vhost->{port} .' on '. 
 						$host->{name} ." ". $vhostapp->{type} ." Updates\n".
 					"\tservicegroups ". $host->{name} ."_". lc($vhostapp->{type}) .
@@ -1248,6 +1251,7 @@ sub generate_nagios_config_files {
 sub run_checks_as_daemon {
 	use Log::Log4perl qw(get_logger :levels);
 	use Proc::Daemon;
+	use IO::Socket::SSL qw();
 	use WWW::Mechanize;
 	use Log::Dispatch;
 	use LWP::ConnCache;
@@ -1261,10 +1265,10 @@ sub run_checks_as_daemon {
 
 	$LOGGER = get_logger("Daemon");
 	$LOGGER->add_appender($appender);
-	$LOGGER->level($INFO);
+	#$LOGGER->level($INFO);
 	#$LOGGER->level($WARN);
-  #$LOGGER->level($DEBUG);
-	#$LOGGER->debug('Logger initialized');
+        $LOGGER->level($DEBUG);
+	$LOGGER->debug('Logger initialized');
 
 	my $servers;
 	my $TERMD = 0;
@@ -1342,8 +1346,14 @@ sub response_redirect {
 		# This is an ugly fix, but to help keep us from ending up in the 
 		# redirection loop then we need to check against a possible 
 		# redirection location set in the check_host method.
-    $LOGGER->info("response_redirect() redirectissue: ". $response->header('Location') ." <==> $LOCATION") if ($LOCATION =~ /radicaldesigns.org/);
-		if ($response->header('Location') eq $LOCATION) {
+                $LOGGER->info("response_redirect() redirectissue: ". 
+			$response->header('Location') ." <==> $LOCATION, ".
+			$response->code ." <==> ". $response->code);
+
+		if (
+			($response->header('Location') eq $LOCATION) && 
+			($response->code eq $CODE)
+		) {
 			$LOCATION = 'matched';
 			return;
 		}
@@ -1359,6 +1369,9 @@ sub response_redirect {
 			}
 			$url .= $response->header('Location');
 		} else {
+			# TODO
+			# BUG! This does not allow for specifying an optional port
+			# You can not have a vhost.query_string == 'homobiles.org:443'
 			$response->header('Location') =~ /(http[^:]*):\/\/([^\/]+)(\/.*)?/;
 			$LOGGER->debug("response_redirect() HOST header: $2");
 			$ua->add_header(HOST => $2);
@@ -1576,9 +1589,17 @@ sub check_host {
 		$http .= 's';
 	}
 
+	# If there is no ip in the vhost record then we are also testing DNS,
+	# cacheing, and load balancing infrastructure that may be in fron of
+	# the actual web servers
+	if (!$ip) {
+		$ip = $name;
+	}
+
 	my $mech = WWW::Mechanize->new( 
 		ssl_opts => { 
-			verify_hostname => 0
+			SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE,
+			verify_hostname => 0, # this key is likely going to be removed in future LWP >6.04
 		} 
 	);
 	$mech->add_handler('response_redirect' => \&response_redirect);
@@ -1593,6 +1614,7 @@ sub check_host {
 	# This is a hack for passing data back and forth betwee the redirection
 	# handler, as we want to exit the handler as soon as there is a match of
 	# the redirection;
+	$CODE = $rc;
 	if ($query_string && $rc =~ /3\d\d/) {
 		$LOCATION = $query_string;
 	} else {
@@ -1626,7 +1648,7 @@ sub check_host {
 				($mech->content() !~ /$query_string/) &&
 				($mech->content(format => 'text') !~ /$query_string/) ){
 				$response .= ' Response did not match "'. $query_string .'".';
-				$code = 3;
+				$code = 2;
 			} #if
 			else {
 				$response .= ' Response matched "'. $query_string .'".';
@@ -1635,7 +1657,7 @@ sub check_host {
 	} #else
 
   # Aug 29 13:01:43 puppet nagios_vhost.pl: DEBUG - [1472500903] PROCESS_SERVICE_CHECK_RESULT;ampocalypse;ampocalypse.radicaldesigns.org:443 on ampocalypse.radicaldesigns.org;2;https://ampocalypse.radicaldesigns.org returned:  Did NOT 302 to expected location: radicaldesigns.org; radicaldesigns.org
-	$LOGGER->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'. 
+	$LOGGER->debug('['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $hostname .';'. 
 		$name .':'. $port . $path .' on '. $hostname .';'. 
 		$code .';'. $response .'; '. $LOCATION);
 
@@ -1643,7 +1665,7 @@ sub check_host {
 		$LOGGER->fatal("Could not open $CMD_FILE to append data to: $!");
 		die;
 	}
-	print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $short_hostname .';'.
+	print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $hostname .';'.
 		$name .':'. $port . $path .' on '. $hostname .';'.
 		$code .';'. $response ."\n";
 	close CMD_FILE;
@@ -1816,7 +1838,7 @@ webservers for vhosts, and will update the nagios vhost config files.
                                      queried and reported on.  In this mode all
                                      output will be sent to syslog in the daemon
                                      context
---external-command-file <file>     : The externaal command file to write 
+--external-command-file <file>     : The external command file to write 
                                      nagios results to.  Default is
                                      /var/lib/nagios3/rw/nagios.cmd
 --update-web-servers [server_list] : Log into each of the web servers 
@@ -1836,7 +1858,9 @@ webservers for vhosts, and will update the nagios vhost config files.
                                      results from 
                                      --web-application-status-to-nagios DEFAULT
                                      /etc/send_nsca.cfg
---database                         : The MySQL databasse name to connect to 
+--database-server                  : The database server name to connect to
+                                     DEFAULT: 127.0.0.1
+--database                         : The MySQL database name to connect to 
                                      DEFAULT: nagios_vhost
 --username                         : The MySQL username to connect with 
                                      DEFAULT: nagios_vhost
