@@ -348,9 +348,9 @@ our ($DATABASE, $USERNAME, $PASSWORD, $WEBAPPLICATION, $DATABASESERVER, $CODE);
 
 # The following globals are used to send web application update status to nsca
 our ($NSCA, $NSCA_HOST, $NSCA_CONFIG);
-$NSCA="/opt/omd/versions/1.20/bin/send_nsca";
+$NSCA="/usr/sbin/send_nsca";
 $NSCA_HOST = 'localhost';
-$NSCA_CONFIG = '/opt/omd/sites/nagvis/etc/send_nsca.cfg';
+$NSCA_CONFIG = '/etc/send_nsca-bottom.cfg';
 
 # The max amount of time that can pass between checking vhosts in seconds
 $MAXTURNAROUNDTIME = 10*60;
@@ -361,9 +361,9 @@ $MAXTHREADSPERHOST = 5;
 
 $VERBOSE = 0;
 $DBFILE = dirname(abs_path($0)) .'/.'. basename($0) .'.db';
-$NAGIOSCONFIGDIR = '/etc/nagios3/conf.d/';
+$NAGIOSCONFIGDIR = '/usr/local/nagios-bottom/etc/conf.d/vhosts';
 $USENSCA = 0;
-$CMD_FILE = '/var/lib/nagios3/rw/nagios.cmd';
+$CMD_FILE = '/usr/local/nagios-bottom/var/rw/nagios.cmd';
 
 $DATABASE = 'nagios_vhost';
 $DATABASESERVER = '127.0.0.1';
@@ -1826,8 +1826,8 @@ sub get_and_send_web_application_status_to_nagios {
 		while (my $line = <READER5>) {
 			# RETURN CODES:
 			# 0-OK, 1-WARNING, 2-CRITICAL, 3-UNKNOWN
-			open(NSCA, "|$NSCA -H $NSCA_HOST -c $NSCA_CONFIG") or 
-				die "could not start nsca: $NSCA -H $NSCA_HOST -c $NSCA_CONFIG";
+			open(NSCA, "|$NSCA -p 5668 -H $NSCA_HOST -c $NSCA_CONFIG") or 
+				die "could not start nsca: $NSCA -p 5668 -H $NSCA_HOST -c $NSCA_CONFIG";
 
 			my $rc = 0;
 			$rc = 1 if $line =~ /WARNING/;
@@ -1861,8 +1861,8 @@ sub get_and_send_web_application_status_to_nagios {
 
 			# RETURN CODES:
 			# 0-OK, 1-WARNING, 2-CRITICAL, 3-UNKNOWN
-			open(NSCA, "|$NSCA -H $NSCA_HOST -c $NSCA_CONFIG") or 
-				die "could not start nsca: $NSCA -H $NSCA_HOST -c $NSCA_CONFIG";
+			open(NSCA, "|$NSCA -p 5668 -H $NSCA_HOST -c $NSCA_CONFIG") or 
+				die "could not start nsca: $NSCA -p 5668 -H $NSCA_HOST -c $NSCA_CONFIG";
 
 			my $rc = 0;
 			$rc = 2 if $line =~ /CRITICAL/;
@@ -1913,7 +1913,7 @@ webservers for vhosts, and will update the nagios vhost config files.
                                      context
 --external-command-file <file>     : The external command file to write 
                                      nagios results to.  Default is
-                                     /var/lib/nagios3/rw/nagios.cmd
+                                     /usr/local/nagios-bottom/var/rw/nagios.cmd
 --update-web-servers [server_list] : Log into each of the web servers 
                                      specified in the optional comma seperated
                                      list of [server_list].  If [server_list] 
