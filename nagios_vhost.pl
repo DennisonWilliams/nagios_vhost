@@ -1123,34 +1123,19 @@ sub generate_nagios_config_files {
 			# types that are not defined here.  We cobbled in support for vhosts,
 			# web_application_updates, drupal_updates, wordpress_updates
 			print HOSTFILE "define service {\n".
-				"\tuse generic-service-passive\n".
+				"\tuse generic-service-passive-no-notification\n".
 				"\tservice_description ". $vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 				"\tservicegroups ". $host->{name} ."_vhosts, vhosts\n".
 				"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
 
-			print HOSTFILE "define servicedependency {\n".
-				"\thost_name ". $host->{nagios_host_name} ."\n".
-				"\tservice_description HTTP\n".
-				"\tdependent_host_name ". $host->{nagios_host_name} ."\n".
-				"\tdependent_service_description ". $vhost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
-				"\texecution_failure_criteria n\n".
-				"\tnotification_failure_criteria w,u,c,p\n}\n\n";
-
 			$stva->execute($vhost->{vhost_id});
 			while (my $vahost = $stva->fetchrow_hashref()) {
 				print HOSTFILE "define service {\n".
-					"\tuse generic-service-passive\n".
+					"\tuse generic-service-passive-no-notification\n".
 					"\tservice_description ". $vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
 					"\tservicegroups ". $host->{name} ."_aliases, vhosts\n".
 					"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
 
-				print HOSTFILE "define servicedependency {\n".
-					"\thost_name ". $host->{nagios_host_name} ."\n".
-					"\tservice_description HTTP\n".
-					"\tdependent_host_name ". $host->{nagios_host_name} ."\n".
-					"\tdependent_service_description ". $vahost->{name} .':'. $vhost->{port} .' on '. $host->{name} ."\n".
-					"\texecution_failure_criteria n\n".
-					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
 			}
 
 			# Generate the configs for the vhost urls
@@ -1160,18 +1145,11 @@ sub generate_nagios_config_files {
 				my $path = $vuhost->{path}?$vuhost->{path}:'';
 
 				print HOSTFILE "define service {\n".
-					"\tuse generic-service-passive\n".
+					"\tuse generic-service-passive-no-notification\n".
 					"\tservice_description ". $vuhost->{name} .':'. $vhost->{port} . $path .' on '. $host->{name} ."\n".
 					"\tservicegroups ". $host->{name} ."_urls, vhosts\n".
 					"\thost_name ". $host->{nagios_host_name} ."\n}\n\n";
 
-				print HOSTFILE "define servicedependency {\n".
-					"\thost_name ". $host->{nagios_host_name} ."\n".
-					"\tservice_description HTTP\n".
-					"\tdependent_host_name ". $host->{nagios_host_name} ."\n".
-					"\tdependent_service_description ". $vuhost->{name} .':'. $vhost->{port} . $path .' on '. $host->{name} ."\n".
-					"\texecution_failure_criteria n\n".
-					"\tnotification_failure_criteria w,u,c,p\n}\n\n";
 			}
 
 			# Create Nagios config entries for the web applications
@@ -1222,11 +1200,23 @@ sub generate_nagios_config_files {
 
 		# We use an On-Demand Group Macro here	
 		# https://assets.nagios.com/downloads/nagioscore/docs/nagioscore/4/en/macros.html
-		print HOSTFILE "define service{\n".
+		print HOSTFILE "define service {\n".
 			"\tuse generic-service\n".
 			"\tservice_description HTTP Vhosts\n".
 			"\thost_name ". $host->{nagios_host_name} ."\n".
-			"\tcheck_command check_service_cluster!\"HTTP Vhosts\"!0!1!\$SERVICESTATEID:". $host->{name} ."_vhosts:,\$\n}\n\n";
+			"\tcheck_command check_service_cluster!\"HTTP Vhosts\"!0!1!".
+				"\$SERVICESTATEID:". $host->{name} ."_vhosts:,\$,".
+				"\$SERVICESTATEID:". $host->{name} ."_aliases:,\$,".
+				"\$SERVICESTATEID:". $host->{name} ."_urls:,\$".
+			"\n}\n\n";
+
+		print HOSTFILE "define servicedependency {\n".
+			"\tservice_description HTTP\n".
+			"\thost_name ". $host->{nagios_host_name} ."\n".
+			"\tdependent_host_name ". $host->{nagios_host_name} ."\n".
+			"\tdependent_service_description HTTP Vhosts\n".
+			"\texecution_failure_criteria n\n".
+			"\tnotification_failure_criteria w,u,c,p\n}\n\n";
 
 		print HOSTFILE "define service{\n".
 			"\tuse generic-service\n".
