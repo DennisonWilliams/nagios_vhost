@@ -349,8 +349,8 @@ our ($DATABASE, $USERNAME, $PASSWORD, $WEBAPPLICATION, $DATABASESERVER, $CODE);
 # The following globals are used to send web application update status to nsca
 our ($NSCA, $NSCA_HOST, $NSCA_CONFIG);
 $NSCA="/usr/sbin/send_nsca";
-$NSCA_HOST = 'localhost';
-$NSCA_CONFIG = '/etc/send_nsca-bottom.cfg';
+$NSCA_HOST = 'nagios';
+$NSCA_CONFIG = '/etc/send_nsca.cfg';
 
 # The max amount of time that can pass between checking vhosts in seconds
 $MAXTURNAROUNDTIME = 10*60;
@@ -1254,9 +1254,9 @@ sub run_checks_as_daemon {
 
 	$LOGGER = get_logger("Daemon");
 	$LOGGER->add_appender($appender);
-	#$LOGGER->level($INFO);
+	$LOGGER->level($INFO);
 	#$LOGGER->level($WARN);
-        $LOGGER->level($DEBUG);
+	#$LOGGER->level($DEBUG);
 	$LOGGER->debug('Logger initialized');
 
 	my $servers;
@@ -1656,14 +1656,28 @@ sub check_host {
 		$name .':'. $port . $path .' on '. $hostname .';'. 
 		$code .';'. $response .'; '. $LOCATION);
 
-	if (! open(CMD_FILE, '>>', $CMD_FILE)) {
-		$LOGGER->fatal("Could not open $CMD_FILE to append data to: $!");
-		die;
+	if ($USENSCA) {
+		$LOGGER->debug("echo -e \"". $hostname .'\t'. "$name:$port${path} on $hostname" .
+		'\t'. $code .'\t'. "$response\" | $NSCA -H $NSCA_HOST -c $NSCA_CONFIG");
+
+		open(NSCA, "|$NSCA -H $NSCA_HOST -c $NSCA_CONFIG") or 
+			die "could not start nsca: $NSCA -H $NSCA_HOST -c $NSCA_CONFIG";
+
+		print NSCA "$hostname\t$name:$port${path} on $hostname\t$code\t$response\n";
+
+		close NSCA;
+
+	} else {
+
+		if (! open(CMD_FILE, '>>', $CMD_FILE)) {
+			$LOGGER->fatal("Could not open $CMD_FILE to append data to: $!");
+			die;
+		}
+		print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $hostname .';'.
+			$name .':'. $port . $path .' on '. $hostname .';'.
+			$code .';'. $response ."\n";
+		close CMD_FILE;
 	}
-	print CMD_FILE '['. time() .'] PROCESS_SERVICE_CHECK_RESULT;'. $hostname .';'.
-		$name .':'. $port . $path .' on '. $hostname .';'.
-		$code .';'. $response ."\n";
-	close CMD_FILE;
 }
 
 # When this is trigered from process_server_vhosts it will cause the loop to 
