@@ -3,6 +3,7 @@ use Data::Dumper;
 use WWW::Mechanize;
 use Getopt::Long;
 use Log::Log4perl qw(get_logger :levels);
+use IO::Socket::SSL qw(SSL_VERIFY_NONE);
 
 my ($VHOST, $IP, $SSL);
 $SSL = 0;
@@ -19,7 +20,7 @@ if (!$VHOST) {
 
 my $mech = WWW::Mechanize->new(
 	ssl_opts => { 
-		SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE,
+		SSL_verify_mode => SSL_VERIFY_NONE,
 		verify_hostname => 0
 	} 
 );

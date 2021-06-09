@@ -1240,7 +1240,7 @@ sub generate_nagios_config_files {
 sub run_checks_as_daemon {
 	use Log::Log4perl qw(get_logger :levels);
 	use Proc::Daemon;
-	use IO::Socket::SSL qw();
+	use IO::Socket::SSL qw(SSL_VERIFY_NONE);
 	use WWW::Mechanize;
 	use Log::Dispatch;
 	use LWP::ConnCache;
@@ -1590,7 +1590,7 @@ sub check_host {
 
 	my $mech = WWW::Mechanize->new( 
 		ssl_opts => { 
-			SSL_verify_mode => IO::Socket::SSL::SSL_VERIFY_NONE,
+			SSL_verify_mode => SSL_VERIFY_NONE,
 			verify_hostname => 0, # this key is likely going to be removed in future LWP >6.04
 		} 
 	);
